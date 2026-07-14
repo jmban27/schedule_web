@@ -1,6 +1,7 @@
 import calendar
 import datetime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit_authenticator as stauth
@@ -172,6 +173,44 @@ def save_study_grid(user_id: int, study_date: datetime.date, grid_df: pd.DataFra
         s.commit()
 
 
+def _minutes_from_anchor(t: datetime.time) -> int:
+    """06:00을 0분으로 하는 상대 분(分) 값 (그리드 기준)."""
+    return ((t.hour - 6) % 24) * 60 + t.minute
+
+
+def quick_fill_blocks(user_id: int, study_date: datetime.date, subject_id: int,
+                       start_time: datetime.time, end_time: datetime.time) -> int:
+    start_min = _minutes_from_anchor(start_time)
+    end_min = _minutes_from_anchor(end_time)
+    if end_min <= start_min:
+        end_min += 24 * 60
+    end_min = min(end_min, 24 * 60)
+
+    slot_start = start_min // 10
+    slot_end = end_min // 10
+    if slot_end <= slot_start:
+        return 0
+
+    with conn.session as s:
+        s.execute(
+            text(
+                "DELETE FROM study_blocks WHERE user_id = :uid AND study_date = :d "
+                "AND slot_index >= :s AND slot_index < :e;"
+            ),
+            {"uid": user_id, "d": study_date, "s": slot_start, "e": slot_end},
+        )
+        for slot in range(slot_start, slot_end):
+            s.execute(
+                text(
+                    "INSERT INTO study_blocks (user_id, subject_id, study_date, slot_index) "
+                    "VALUES (:uid, :sid, :d, :si);"
+                ),
+                {"uid": user_id, "sid": subject_id, "d": study_date, "si": slot},
+            )
+        s.commit()
+    return slot_end - slot_start
+
+
 def get_month_daily_minutes(user_id: int, year: int, month: int) -> dict:
     start = datetime.date(year, month, 1)
     end = datetime.date(year + (month == 12), (month % 12) + 1, 1)
@@ -201,15 +240,18 @@ def render_month_heatmap(daily_minutes: dict, year: int, month: int):
             minutes = daily_minutes.get(day, 0) if in_month else 0
             alpha = 0.08 if minutes == 0 else min(1.0, 0.15 + 0.85 * (minutes / max_min))
             h, m = divmod(minutes, 60)
-            time_txt = f"{h}:{m:02d}" if minutes > 0 else ""
-            text_color = "#fff" if alpha > 0.5 else "#333"
+            if not in_month:
+                time_txt = ""
+            else:
+                time_txt = f"{h}시간 {m}분" if minutes > 0 else "-"
+            text_color = "#fff" if alpha > 0.5 else "#444"
+            sub_color = "#eee" if alpha > 0.5 else "#999"
             opacity_style = f"background: rgba(124,58,237,{alpha});" if in_month else "background:#f4f4f4;"
             day_num = day.day if in_month else ""
             html += (
-                f"<td style='{opacity_style}padding:8px 2px;border-radius:6px;color:{text_color};"
-                f"font-size:12px;width:14%;'>"
-                f"<div style='font-weight:600;'>{day_num}</div>"
-                f"<div style='font-size:11px;'>{time_txt}</div></td>"
+                f"<td style='{opacity_style}padding:10px 2px;border-radius:8px;color:{text_color};'>"
+                f"<div style='font-size:11px;color:{sub_color};'>{day_num}</div>"
+                f"<div style='font-size:16px;font-weight:700;margin-top:2px;'>{time_txt}</div></td>"
             )
         html += "</tr>"
     html += "</table>"
@@ -235,6 +277,32 @@ def page_study_time(user_id: int):
 
     study_date = st.date_input("기록할 날짜", datetime.date.today(), key="study_grid_date")
 
+    # ---- 빠른 입력: 과목 + 시작~종료 시간으로 한 번에 채우기 ----
+    st.subheader("⏱️ 빠르게 기록하기")
+    with st.form("quick_fill_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+        with c1:
+            quick_subject = st.selectbox("과목", list(subjects_df["name"]), key="quick_subject")
+        with c2:
+            quick_start = st.time_input("시작 시간", datetime.time(9, 0), step=600, key="quick_start")
+        with c3:
+            quick_end = st.time_input("종료 시간", datetime.time(11, 0), step=600, key="quick_end")
+        with c4:
+            st.write("")
+            fill_submitted = st.form_submit_button("✅ 채우기", type="primary")
+
+        if fill_submitted:
+            filled = quick_fill_blocks(
+                user_id, study_date, name_to_id[quick_subject], quick_start, quick_end
+            )
+            if filled > 0:
+                st.success(f"{quick_subject} — {filled * 10}분이 기록되었습니다!")
+                st.rerun()
+            else:
+                st.warning("종료 시간이 시작 시간보다 늦어야 합니다.")
+
+    st.caption("같은 시간대를 다시 채우면 이전 과목이 덮어씌워집니다. 겹치지 않게만 채우면 여러 과목을 자유롭게 기록할 수 있어요.")
+
     # 그리드 초기화 + 기존 데이터 반영
     grid_df = pd.DataFrame("", index=HOUR_LABELS, columns=MIN_LABELS)
     blocks_df = load_study_blocks(user_id, study_date)
@@ -243,27 +311,28 @@ def page_study_time(user_id: int):
         r, c = divmod(int(row["slot_index"]), 6)
         grid_df.iat[r, c] = id_to_name.get(row["subject_id"], "")
 
-    st.caption("각 칸을 클릭해서 과목을 선택하세요 (10분 단위, 06:00 ~ 다음날 05:50).")
+    with st.expander("🔧 세부 수정 (10분 단위로 칸 하나씩 직접 지정)"):
+        st.caption("각 칸을 클릭해서 과목을 선택하세요 (10분 단위, 06:00 ~ 다음날 05:50).")
 
-    column_config = {
-        col: st.column_config.SelectboxColumn(
-            col, options=[""] + list(subjects_df["name"]), width="small"
+        column_config = {
+            col: st.column_config.SelectboxColumn(
+                col, options=[""] + list(subjects_df["name"]), width="small"
+            )
+            for col in MIN_LABELS
+        }
+
+        edited_df = st.data_editor(
+            grid_df,
+            column_config=column_config,
+            use_container_width=True,
+            height=560,
+            key="study_grid_editor",
         )
-        for col in MIN_LABELS
-    }
 
-    edited_df = st.data_editor(
-        grid_df,
-        column_config=column_config,
-        use_container_width=True,
-        height=560,
-        key="study_grid_editor",
-    )
-
-    if st.button("💾 저장하기", type="primary"):
-        save_study_grid(user_id, study_date, edited_df, name_to_id)
-        st.success("저장되었습니다!")
-        st.rerun()
+        if st.button("💾 세부 수정 내용 저장", type="primary"):
+            save_study_grid(user_id, study_date, edited_df, name_to_id)
+            st.success("저장되었습니다!")
+            st.rerun()
 
     # 과목별 공부 시간 요약
     st.subheader("오늘의 과목별 공부 시간")
@@ -382,7 +451,102 @@ def get_overdue_lectures(user_id: int) -> pd.DataFrame:
     )
 
 
+def _event_minutes(t: datetime.time | None):
+    return t.hour * 60 + t.minute if t is not None else None
+
+
+def _event_color(ev, subjects_color: dict, default_color: str) -> str:
+    subj = ev.get("subject_name")
+    if subj and subj in subjects_color:
+        return subjects_color[subj]
+    return default_color
+
+
+def render_timetable_day(events_df: pd.DataFrame, subjects_color: dict, default_color: str) -> str:
+    hour_h = 30
+    total_h = hour_h * 24
+    timed = (
+        events_df[events_df["start_time"].notna() & events_df["end_time"].notna()]
+        if not events_df.empty else events_df
+    )
+
+    html = "<div style='display:flex;'>"
+    html += "<div style='width:46px;flex-shrink:0;'>"
+    for h in range(24):
+        html += (
+            f"<div style='height:{hour_h}px;font-size:10px;color:#999;text-align:right;"
+            f"padding-right:6px;box-sizing:border-box;'>{h:02d}:00</div>"
+        )
+    html += "</div>"
+    html += f"<div style='position:relative;flex:1;height:{total_h}px;border-left:1px solid #e5e5e5;'>"
+    for h in range(24):
+        top = h * hour_h
+        html += f"<div style='position:absolute;top:{top}px;left:0;right:0;border-top:1px solid #f0f0f0;'></div>"
+    for _, ev in timed.iterrows():
+        s_min, e_min = _event_minutes(ev["start_time"]), _event_minutes(ev["end_time"])
+        if e_min <= s_min:
+            e_min = s_min + 30
+        top = s_min / 60 * hour_h
+        height = max((e_min - s_min) / 60 * hour_h, 18)
+        color = _event_color(ev, subjects_color, default_color)
+        style_extra = "opacity:0.4;text-decoration:line-through;" if bool(ev["is_done"]) else ""
+        html += (
+            f"<div style='position:absolute;top:{top}px;height:{height}px;left:6px;right:6px;"
+            f"background:{color};color:white;border-radius:5px;padding:3px 6px;font-size:12px;"
+            f"overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.15);{style_extra}'>{ev['title']}</div>"
+        )
+    html += "</div></div>"
+    return html
+
+
+def render_timetable_week(events_df: pd.DataFrame, week_start: datetime.date, subjects_color: dict, default_color: str) -> str:
+    hour_h = 26
+    total_h = hour_h * 24
+    labels = ["월", "화", "수", "목", "금", "토", "일"]
+
+    html = "<div style='padding-top:22px;'><div style='display:flex;'>"
+    html += "<div style='width:40px;flex-shrink:0;'>"
+    for h in range(24):
+        html += f"<div style='height:{hour_h}px;font-size:9px;color:#999;text-align:right;padding-right:4px;'>{h:02d}</div>"
+    html += "</div>"
+
+    for i in range(7):
+        d = week_start + datetime.timedelta(days=i)
+        day_events = events_df[events_df["event_date"] == d] if not events_df.empty else pd.DataFrame()
+        timed = (
+            day_events[day_events["start_time"].notna() & day_events["end_time"].notna()]
+            if not day_events.empty else day_events
+        )
+        html += f"<div style='flex:1;position:relative;height:{total_h}px;border-left:1px solid #eee;'>"
+        html += (
+            f"<div style='position:absolute;top:-20px;left:0;right:0;text-align:center;"
+            f"font-size:11px;font-weight:600;color:#555;'>{labels[i]} {d.day}</div>"
+        )
+        for h in range(24):
+            top = h * hour_h
+            html += f"<div style='position:absolute;top:{top}px;left:0;right:0;border-top:1px solid #f5f5f5;'></div>"
+        for _, ev in timed.iterrows():
+            s_min, e_min = _event_minutes(ev["start_time"]), _event_minutes(ev["end_time"])
+            if e_min <= s_min:
+                e_min = s_min + 30
+            top = s_min / 60 * hour_h
+            height = max((e_min - s_min) / 60 * hour_h, 15)
+            color = _event_color(ev, subjects_color, default_color)
+            style_extra = "opacity:0.4;text-decoration:line-through;" if bool(ev["is_done"]) else ""
+            html += (
+                f"<div style='position:absolute;top:{top}px;height:{height}px;left:2px;right:2px;"
+                f"background:{color};color:#fff;font-size:9px;border-radius:4px;padding:1px 4px;"
+                f"overflow:hidden;{style_extra}'>{ev['title']}</div>"
+            )
+        html += "</div>"
+    html += "</div></div>"
+    return html
+
+
 def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFrame):
+    subjects_color = dict(zip(subjects_df["name"], subjects_df["color"]))
+    default_color = "#7c3aed" if category == "study" else "#0ea5e9"
+
     if category == "study":
         overdue = get_overdue_lectures(user_id)
         if not overdue.empty:
@@ -490,10 +654,16 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
 
     if view == "일":
         st.write(f"**{ref_date} 일정**")
+        day_events_df = load_events(user_id, category, ref_date, ref_date)
+        st.markdown(render_timetable_day(day_events_df, subjects_color, default_color), unsafe_allow_html=True)
+        st.caption("⬇️ 완료 체크와 상세/삭제는 아래에서 할 수 있어요.")
         render_day_events(ref_date)
 
     elif view == "주":
         week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
+        week_events_df = load_events(user_id, category, week_start, week_start + datetime.timedelta(days=6))
+        st.markdown(render_timetable_week(week_events_df, week_start, subjects_color, default_color), unsafe_allow_html=True)
+        st.caption("⬇️ 완료 체크와 상세/삭제는 아래에서 할 수 있어요.")
         for i in range(7):
             d = week_start + datetime.timedelta(days=i)
             st.markdown(f"**{d} ({['월','화','수','목','금','토','일'][i]})**")
@@ -503,27 +673,41 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
         month_start = ref_date.replace(day=1)
         month_end = (month_start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1) - datetime.timedelta(days=1)
         events_df = load_events(user_id, category, month_start, month_end)
-        counts = events_df.groupby("event_date").size().to_dict() if not events_df.empty else {}
 
         cal = calendar.Calendar(firstweekday=0)
-        html = "<table style='width:100%;border-collapse:collapse;text-align:center;'><tr>"
-        html += "".join(f"<th style='color:#888;font-size:12px;'>{d}</th>" for d in ["월","화","수","목","금","토","일"])
+        html = "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'><tr>"
+        html += "".join(
+            f"<th style='color:#888;font-size:12px;padding:6px;'>{d}</th>" for d in ["월", "화", "수", "목", "금", "토", "일"]
+        )
         html += "</tr>"
         for week in cal.monthdatescalendar(ref_date.year, ref_date.month):
             html += "<tr>"
             for day in week:
                 in_month = day.month == ref_date.month
-                cnt = counts.get(day, 0) if in_month else 0
-                bg = "#ede9fe" if cnt > 0 else ("#fafafa" if in_month else "#f4f4f4")
+                day_titles = []
+                if in_month and not events_df.empty:
+                    day_titles = events_df[events_df["event_date"] == day]["title"].tolist()
+
+                bg = "#fafafa" if in_month else "#f4f4f4"
+                title_html = ""
+                for t in day_titles[:3]:
+                    title_html += (
+                        f"<div style='background:{default_color};color:#fff;border-radius:3px;font-size:10px;"
+                        f"padding:1px 4px;margin-top:3px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{t}</div>"
+                    )
+                if len(day_titles) > 3:
+                    title_html += f"<div style='font-size:10px;color:#888;margin-top:2px;'>+{len(day_titles) - 3}개 더</div>"
+
                 html += (
-                    f"<td style='background:{bg};padding:8px 2px;border-radius:6px;font-size:12px;'>"
-                    f"<div style='font-weight:600;'>{day.day if in_month else ''}</div>"
-                    f"<div style='font-size:11px;color:#7c3aed;'>{'●' * min(cnt,3) if cnt else ''}</div></td>"
+                    f"<td style='background:{bg};vertical-align:top;padding:6px;border:1px solid #eee;"
+                    f"height:110px;width:14.28%;'>"
+                    f"<div style='font-size:12px;font-weight:600;color:#555;'>{day.day if in_month else ''}</div>"
+                    f"{title_html}</td>"
                 )
             html += "</tr>"
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
-        st.caption("칸을 클릭할 수는 없어요 — 위의 '일/주' 보기에서 날짜를 이동해 상세 일정을 확인하세요.")
+        st.caption("칸을 클릭할 수는 없어요 — '일/주' 보기에서 날짜를 이동해 상세 일정을 확인·체크하세요.")
 
     st.divider()
 
@@ -543,8 +727,17 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
         else:
             rates.append(round(day_events["is_done"].sum() / len(day_events) * 100))
 
-    chart_df = pd.DataFrame({"완성율(%)": rates}, index=labels)
-    st.bar_chart(chart_df)
+    chart_df = pd.DataFrame({"요일": labels, "완성율": rates})
+    bars = alt.Chart(chart_df).mark_bar(color=default_color, size=32).encode(
+        x=alt.X("요일:N", sort=labels, title=None),
+        y=alt.Y(
+            "완성율:Q",
+            scale=alt.Scale(domain=[0, 100]),
+            axis=alt.Axis(values=list(range(0, 101, 10)), title="완성율(%)"),
+        ),
+    )
+    value_labels = bars.mark_text(dy=-8, color="#333", fontSize=12).encode(text=alt.Text("완성율:Q"))
+    st.altair_chart((bars + value_labels).properties(height=320), use_container_width=True)
 
     if len(week_events) > 0:
         overall = round(week_events["is_done"].sum() / len(week_events) * 100)
