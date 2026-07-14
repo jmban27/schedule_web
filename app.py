@@ -228,7 +228,7 @@ def render_month_heatmap(daily_minutes: dict, year: int, month: int):
     weeks = cal.monthdatescalendar(year, month)
     max_min = max(daily_minutes.values()) if daily_minutes else 1
 
-    html = "<table style='width:100%;border-collapse:collapse;text-align:center;'>"
+    html = "<table style='width:100%;table-layout:fixed;border-collapse:separate;border-spacing:4px;text-align:center;'>"
     html += "<tr>" + "".join(
         f"<th style='padding:4px;color:#888;font-size:12px;'>{d}</th>" for d in ["월", "화", "수", "목", "금", "토", "일"]
     ) + "</tr>"
@@ -249,9 +249,10 @@ def render_month_heatmap(daily_minutes: dict, year: int, month: int):
             opacity_style = f"background: rgba(124,58,237,{alpha});" if in_month else "background:#f4f4f4;"
             day_num = day.day if in_month else ""
             html += (
-                f"<td style='{opacity_style}padding:10px 2px;border-radius:8px;color:{text_color};'>"
+                f"<td style='{opacity_style}width:14.28%;height:64px;border-radius:8px;color:{text_color};"
+                f"overflow:hidden;box-sizing:border-box;padding:6px 2px;'>"
                 f"<div style='font-size:11px;color:{sub_color};'>{day_num}</div>"
-                f"<div style='font-size:16px;font-weight:700;margin-top:2px;'>{time_txt}</div></td>"
+                f"<div style='font-size:14px;font-weight:700;margin-top:2px;white-space:nowrap;'>{time_txt}</div></td>"
             )
         html += "</tr>"
     html += "</table>"
@@ -363,6 +364,25 @@ def page_study_time(user_id: int):
         th, tm = divmod(total_minutes, 60)
         st.metric("오늘 총 공부 시간", f"{th}시간 {tm}분")
 
+        pie_df = pd.DataFrame(
+            {"과목": list(subj_counter.keys()), "분": [c * 10 for c in subj_counter.values()]}
+        )
+        pie_chart = (
+            alt.Chart(pie_df)
+            .mark_arc(innerRadius=60)
+            .encode(
+                theta=alt.Theta("분:Q"),
+                color=alt.Color(
+                    "과목:N",
+                    scale=alt.Scale(domain=list(pie_df["과목"]), range=[name_to_color[s] for s in pie_df["과목"]]),
+                    legend=alt.Legend(title=None),
+                ),
+                tooltip=["과목", "분"],
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(pie_chart, use_container_width=True)
+
     st.divider()
 
     # 월별 히트맵
@@ -423,9 +443,17 @@ def add_event(user_id, category, subject_id, title, event_date, start_time, end_
     )
 
 
-def load_events(user_id: int, category: str, date_from: datetime.date, date_to: datetime.date) -> pd.DataFrame:
+def load_events(user_id: int, category, date_from: datetime.date, date_to: datetime.date) -> pd.DataFrame:
+    if category is None:
+        return run_query(
+            "SELECT e.id, e.category, e.title, e.event_date, e.start_time, e.end_time, e.memo, e.is_done, "
+            "s.name AS subject_name FROM events e LEFT JOIN subjects s ON e.subject_id = s.id "
+            "WHERE e.user_id = :uid "
+            "AND e.event_date BETWEEN :df AND :dt ORDER BY e.event_date, e.start_time;",
+            {"uid": user_id, "df": date_from, "dt": date_to},
+        )
     return run_query(
-        "SELECT e.id, e.title, e.event_date, e.start_time, e.end_time, e.memo, e.is_done, "
+        "SELECT e.id, e.category, e.title, e.event_date, e.start_time, e.end_time, e.memo, e.is_done, "
         "s.name AS subject_name FROM events e LEFT JOIN subjects s ON e.subject_id = s.id "
         "WHERE e.user_id = :uid AND e.category = :cat "
         "AND e.event_date BETWEEN :df AND :dt ORDER BY e.event_date, e.start_time;",
@@ -455,14 +483,16 @@ def _event_minutes(t: datetime.time | None):
     return t.hour * 60 + t.minute if t is not None else None
 
 
-def _event_color(ev, subjects_color: dict, default_color: str) -> str:
+def _event_color(ev, subjects_color: dict, default_color: str, category_colors: dict | None = None) -> str:
     subj = ev.get("subject_name")
     if subj and subj in subjects_color:
         return subjects_color[subj]
+    if category_colors and ev.get("category") in category_colors:
+        return category_colors[ev["category"]]
     return default_color
 
 
-def render_timetable_day(events_df: pd.DataFrame, subjects_color: dict, default_color: str) -> str:
+def render_timetable_day(events_df: pd.DataFrame, subjects_color: dict, default_color: str, category_colors: dict | None = None) -> str:
     hour_h = 30
     total_h = hour_h * 24
     timed = (
@@ -488,7 +518,7 @@ def render_timetable_day(events_df: pd.DataFrame, subjects_color: dict, default_
             e_min = s_min + 30
         top = s_min / 60 * hour_h
         height = max((e_min - s_min) / 60 * hour_h, 18)
-        color = _event_color(ev, subjects_color, default_color)
+        color = _event_color(ev, subjects_color, default_color, category_colors)
         style_extra = "opacity:0.4;text-decoration:line-through;" if bool(ev["is_done"]) else ""
         html += (
             f"<div style='position:absolute;top:{top}px;height:{height}px;left:6px;right:6px;"
@@ -499,7 +529,7 @@ def render_timetable_day(events_df: pd.DataFrame, subjects_color: dict, default_
     return html
 
 
-def render_timetable_week(events_df: pd.DataFrame, week_start: datetime.date, subjects_color: dict, default_color: str) -> str:
+def render_timetable_week(events_df: pd.DataFrame, week_start: datetime.date, subjects_color: dict, default_color: str, category_colors: dict | None = None) -> str:
     hour_h = 26
     total_h = hour_h * 24
     labels = ["월", "화", "수", "목", "금", "토", "일"]
@@ -531,7 +561,7 @@ def render_timetable_week(events_df: pd.DataFrame, week_start: datetime.date, su
                 e_min = s_min + 30
             top = s_min / 60 * hour_h
             height = max((e_min - s_min) / 60 * hour_h, 15)
-            color = _event_color(ev, subjects_color, default_color)
+            color = _event_color(ev, subjects_color, default_color, category_colors)
             style_extra = "opacity:0.4;text-decoration:line-through;" if bool(ev["is_done"]) else ""
             html += (
                 f"<div style='position:absolute;top:{top}px;height:{height}px;left:2px;right:2px;"
@@ -540,6 +570,69 @@ def render_timetable_week(events_df: pd.DataFrame, week_start: datetime.date, su
             )
         html += "</div>"
     html += "</div></div>"
+    return html
+
+
+def render_day_events(user_id: int, category, d: datetime.date, key_prefix: str):
+    events_df = load_events(user_id, category, d, d)
+    if events_df.empty:
+        st.caption("일정 없음")
+        return
+    for _, ev in events_df.iterrows():
+        cat_tag = ""
+        if category is None:
+            cat_tag = " 📚" if ev["category"] == "study" else " 🏠"
+        checked = st.checkbox(
+            f"{ev['title']}{cat_tag} ({ev['start_time']}~{ev['end_time']})",
+            value=bool(ev["is_done"]),
+            key=f"ev_{key_prefix}_{ev['id']}",
+        )
+        if checked != bool(ev["is_done"]):
+            toggle_event_done(ev["id"], checked)
+            st.rerun()
+        with st.expander("상세"):
+            st.write(ev["memo"] or "메모 없음")
+            if ev["subject_name"]:
+                st.caption(f"과목: {ev['subject_name']}")
+            if st.button("이 일정 삭제", key=f"del_ev_{key_prefix}_{ev['id']}"):
+                delete_event(ev["id"])
+                st.rerun()
+
+
+def render_month_calendar_html(events_df: pd.DataFrame, ref_date: datetime.date, color_fn) -> str:
+    cal = calendar.Calendar(firstweekday=0)
+    html = "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'><tr>"
+    html += "".join(
+        f"<th style='color:#888;font-size:12px;padding:6px;'>{d}</th>" for d in ["월", "화", "수", "목", "금", "토", "일"]
+    )
+    html += "</tr>"
+    for week in cal.monthdatescalendar(ref_date.year, ref_date.month):
+        html += "<tr>"
+        for day in week:
+            in_month = day.month == ref_date.month
+            day_rows = pd.DataFrame()
+            if in_month and not events_df.empty:
+                day_rows = events_df[events_df["event_date"] == day]
+
+            bg = "#fafafa" if in_month else "#f4f4f4"
+            title_html = ""
+            for _, ev in day_rows.head(3).iterrows():
+                chip_color = color_fn(ev)
+                title_html += (
+                    f"<div style='background:{chip_color};color:#fff;border-radius:3px;font-size:10px;"
+                    f"padding:1px 4px;margin-top:3px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{ev['title']}</div>"
+                )
+            if len(day_rows) > 3:
+                title_html += f"<div style='font-size:10px;color:#888;margin-top:2px;'>+{len(day_rows) - 3}개 더</div>"
+
+            html += (
+                f"<td style='background:{bg};vertical-align:top;padding:6px;border:1px solid #eee;"
+                f"height:110px;width:14.28%;'>"
+                f"<div style='font-size:12px;font-weight:600;color:#555;'>{day.day if in_month else ''}</div>"
+                f"{title_html}</td>"
+            )
+        html += "</tr>"
+    html += "</table>"
     return html
 
 
@@ -630,34 +723,12 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
     with nav2:
         st.markdown(f"<div style='text-align:center;font-weight:600;'>{ref_date}</div>", unsafe_allow_html=True)
 
-    def render_day_events(d: datetime.date):
-        events_df = load_events(user_id, category, d, d)
-        if events_df.empty:
-            st.caption("일정 없음")
-            return
-        for _, ev in events_df.iterrows():
-            checked = st.checkbox(
-                f"{ev['title']} ({ev['start_time']}~{ev['end_time']})",
-                value=bool(ev["is_done"]),
-                key=f"ev_{category}_{ev['id']}",
-            )
-            if checked != bool(ev["is_done"]):
-                toggle_event_done(ev["id"], checked)
-                st.rerun()
-            with st.expander("상세"):
-                st.write(ev["memo"] or "메모 없음")
-                if ev["subject_name"]:
-                    st.caption(f"과목: {ev['subject_name']}")
-                if st.button("이 일정 삭제", key=f"del_ev_{category}_{ev['id']}"):
-                    delete_event(ev["id"])
-                    st.rerun()
-
     if view == "일":
         st.write(f"**{ref_date} 일정**")
         day_events_df = load_events(user_id, category, ref_date, ref_date)
         st.markdown(render_timetable_day(day_events_df, subjects_color, default_color), unsafe_allow_html=True)
         st.caption("⬇️ 완료 체크와 상세/삭제는 아래에서 할 수 있어요.")
-        render_day_events(ref_date)
+        render_day_events(user_id, category, ref_date, key_prefix=category)
 
     elif view == "주":
         week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
@@ -667,93 +738,131 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
         for i in range(7):
             d = week_start + datetime.timedelta(days=i)
             st.markdown(f"**{d} ({['월','화','수','목','금','토','일'][i]})**")
-            render_day_events(d)
+            render_day_events(user_id, category, d, key_prefix=category)
 
     else:  # 월
         month_start = ref_date.replace(day=1)
         month_end = (month_start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1) - datetime.timedelta(days=1)
         events_df = load_events(user_id, category, month_start, month_end)
 
-        cal = calendar.Calendar(firstweekday=0)
-        html = "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'><tr>"
-        html += "".join(
-            f"<th style='color:#888;font-size:12px;padding:6px;'>{d}</th>" for d in ["월", "화", "수", "목", "금", "토", "일"]
-        )
-        html += "</tr>"
-        for week in cal.monthdatescalendar(ref_date.year, ref_date.month):
-            html += "<tr>"
-            for day in week:
-                in_month = day.month == ref_date.month
-                day_titles = []
-                if in_month and not events_df.empty:
-                    day_titles = events_df[events_df["event_date"] == day]["title"].tolist()
+        def color_fn(ev):
+            return _event_color(ev, subjects_color, default_color)
 
-                bg = "#fafafa" if in_month else "#f4f4f4"
-                title_html = ""
-                for t in day_titles[:3]:
-                    title_html += (
-                        f"<div style='background:{default_color};color:#fff;border-radius:3px;font-size:10px;"
-                        f"padding:1px 4px;margin-top:3px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;'>{t}</div>"
-                    )
-                if len(day_titles) > 3:
-                    title_html += f"<div style='font-size:10px;color:#888;margin-top:2px;'>+{len(day_titles) - 3}개 더</div>"
-
-                html += (
-                    f"<td style='background:{bg};vertical-align:top;padding:6px;border:1px solid #eee;"
-                    f"height:110px;width:14.28%;'>"
-                    f"<div style='font-size:12px;font-weight:600;color:#555;'>{day.day if in_month else ''}</div>"
-                    f"{title_html}</td>"
-                )
-            html += "</tr>"
-        html += "</table>"
+        html = render_month_calendar_html(events_df, ref_date, color_fn)
         st.markdown(html, unsafe_allow_html=True)
         st.caption("칸을 클릭할 수는 없어요 — '일/주' 보기에서 날짜를 이동해 상세 일정을 확인·체크하세요.")
 
-    st.divider()
+    if category == "study":
+        st.divider()
 
-    # ---- 주간 완성율 통계 ----
-    st.subheader("📊 주간 완성율 통계")
-    week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
-    week_end = week_start + datetime.timedelta(days=6)
-    week_events = load_events(user_id, category, week_start, week_end)
+        # ---- 주간 완성율 통계 (공부 일정에만 표시) ----
+        st.subheader("📊 주간 완성율 통계")
+        week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
+        week_end = week_start + datetime.timedelta(days=6)
+        week_events = load_events(user_id, category, week_start, week_end)
 
-    labels = ["월", "화", "수", "목", "금", "토", "일"]
-    rates = []
-    for i in range(7):
-        d = week_start + datetime.timedelta(days=i)
-        day_events = week_events[week_events["event_date"] == d] if not week_events.empty else pd.DataFrame()
-        if len(day_events) == 0:
-            rates.append(0)
+        labels = ["월", "화", "수", "목", "금", "토", "일"]
+        rates = []
+        for i in range(7):
+            d = week_start + datetime.timedelta(days=i)
+            day_events = week_events[week_events["event_date"] == d] if not week_events.empty else pd.DataFrame()
+            if len(day_events) == 0:
+                rates.append(0)
+            else:
+                rates.append(round(day_events["is_done"].sum() / len(day_events) * 100))
+
+        chart_df = pd.DataFrame({"요일": labels, "완성율": rates})
+        bars = alt.Chart(chart_df).mark_bar(color=default_color, size=32).encode(
+            x=alt.X("요일:N", sort=labels, title=None),
+            y=alt.Y(
+                "완성율:Q",
+                scale=alt.Scale(domain=[0, 100]),
+                axis=alt.Axis(values=list(range(0, 101, 10)), title="완성율(%)"),
+            ),
+        )
+        value_labels = bars.mark_text(dy=-8, color="#333", fontSize=12).encode(text=alt.Text("완성율:Q"))
+        st.altair_chart((bars + value_labels).properties(height=320), use_container_width=True)
+
+        if len(week_events) > 0:
+            overall = round(week_events["is_done"].sum() / len(week_events) * 100)
+            st.caption(f"이번 주({week_start} ~ {week_end}) 전체 완성율: {overall}%")
         else:
-            rates.append(round(day_events["is_done"].sum() / len(day_events) * 100))
+            st.caption("이번 주에는 등록된 일정이 없습니다.")
 
-    chart_df = pd.DataFrame({"요일": labels, "완성율": rates})
-    bars = alt.Chart(chart_df).mark_bar(color=default_color, size=32).encode(
-        x=alt.X("요일:N", sort=labels, title=None),
-        y=alt.Y(
-            "완성율:Q",
-            scale=alt.Scale(domain=[0, 100]),
-            axis=alt.Axis(values=list(range(0, 101, 10)), title="완성율(%)"),
-        ),
-    )
-    value_labels = bars.mark_text(dy=-8, color="#333", fontSize=12).encode(text=alt.Text("완성율:Q"))
-    st.altair_chart((bars + value_labels).properties(height=320), use_container_width=True)
 
-    if len(week_events) > 0:
-        overall = round(week_events["is_done"].sum() / len(week_events) * 100)
-        st.caption(f"이번 주({week_start} ~ {week_end}) 전체 완성율: {overall}%")
-    else:
-        st.caption("이번 주에는 등록된 일정이 없습니다.")
+def render_combined_calendar(user_id: int, subjects_df: pd.DataFrame):
+    subjects_color = dict(zip(subjects_df["name"], subjects_df["color"]))
+    category_colors = {"study": "#7c3aed", "personal": "#0ea5e9"}
+
+    st.caption("🟣 공부 일정 · 🔵 개인 일정")
+    view = st.radio("보기", ["일", "주", "월"], horizontal=True, key="view_combined")
+
+    ref_key = "ref_date_combined"
+    if ref_key not in st.session_state:
+        st.session_state[ref_key] = datetime.date.today()
+    ref_date = st.session_state[ref_key]
+
+    nav1, nav2, nav3 = st.columns([1, 3, 1])
+    with nav1:
+        if st.button("◀", key="prev_combined"):
+            delta = {"일": 1, "주": 7, "월": 30}[view]
+            st.session_state[ref_key] = ref_date - datetime.timedelta(days=delta)
+            st.rerun()
+    with nav3:
+        if st.button("▶", key="next_combined"):
+            delta = {"일": 1, "주": 7, "월": 30}[view]
+            st.session_state[ref_key] = ref_date + datetime.timedelta(days=delta)
+            st.rerun()
+    with nav2:
+        st.markdown(f"<div style='text-align:center;font-weight:600;'>{ref_date}</div>", unsafe_allow_html=True)
+
+    if view == "일":
+        st.write(f"**{ref_date} 일정**")
+        day_events_df = load_events(user_id, None, ref_date, ref_date)
+        st.markdown(
+            render_timetable_day(day_events_df, subjects_color, category_colors["personal"], category_colors),
+            unsafe_allow_html=True,
+        )
+        st.caption("⬇️ 완료 체크와 상세/삭제는 아래에서 할 수 있어요.")
+        render_day_events(user_id, None, ref_date, key_prefix="combined")
+
+    elif view == "주":
+        week_start = ref_date - datetime.timedelta(days=ref_date.weekday())
+        week_events_df = load_events(user_id, None, week_start, week_start + datetime.timedelta(days=6))
+        st.markdown(
+            render_timetable_week(week_events_df, week_start, subjects_color, category_colors["personal"], category_colors),
+            unsafe_allow_html=True,
+        )
+        st.caption("⬇️ 완료 체크와 상세/삭제는 아래에서 할 수 있어요.")
+        for i in range(7):
+            d = week_start + datetime.timedelta(days=i)
+            st.markdown(f"**{d} ({['월','화','수','목','금','토','일'][i]})**")
+            render_day_events(user_id, None, d, key_prefix="combined")
+
+    else:  # 월
+        month_start = ref_date.replace(day=1)
+        month_end = (month_start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1) - datetime.timedelta(days=1)
+        events_df = load_events(user_id, None, month_start, month_end)
+
+        def color_fn(ev):
+            return _event_color(ev, subjects_color, category_colors["personal"], category_colors)
+
+        html = render_month_calendar_html(events_df, ref_date, color_fn)
+        st.markdown(html, unsafe_allow_html=True)
+        st.caption("칸을 클릭할 수는 없어요 — '일/주' 보기에서 날짜를 이동해 상세 일정을 확인·체크하세요.")
 
 
 def page_schedule(user_id: int):
     st.title("🗓️ 일정 관리")
     subjects_df = get_subjects(user_id)
-    tab1, tab2 = st.tabs(["📚 공부 일정", "🏠 개인 일정"])
+    tab1, tab2, tab3 = st.tabs(["📚 공부 일정", "🏠 개인 일정", "📌 최종 내 일정"])
     with tab1:
         render_schedule_category(user_id, "study", subjects_df)
     with tab2:
         render_schedule_category(user_id, "personal", subjects_df)
+    with tab3:
+        st.subheader("📌 공부 + 개인 통합 캘린더")
+        render_combined_calendar(user_id, subjects_df)
 
 
 # ============================================================
@@ -840,7 +949,7 @@ def page_lectures(user_id: int):
                     with c2:
                         overdue_flag = (
                             lec["due_date"]
-                            and lec["due_date"] <= datetime.date.today()
+                            and lec["due_date"] < datetime.date.today()
                             and not lec["is_completed"]
                         )
                         due_txt = str(lec["due_date"]) if lec["due_date"] else "미정"
@@ -859,7 +968,7 @@ def page_lectures(user_id: int):
                 missed = int(
                     (
                         (lectures_df["due_date"].notna())
-                        & (lectures_df["due_date"] <= datetime.date.today())
+                        & (lectures_df["due_date"] < datetime.date.today())
                         & (~lectures_df["is_completed"])
                     ).sum()
                 )
