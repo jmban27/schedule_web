@@ -575,12 +575,17 @@ def load_lectures(user_id: int, subject_id: int) -> pd.DataFrame:
 
 
 def add_lecture(user_id: int, subject_id: int, title: str, due_date):
-    df = run_query(
-        "INSERT INTO lectures (user_id, subject_id, title, due_date) "
-        "VALUES (:uid, :sid, :title, :due) RETURNING id;",
-        {"uid": user_id, "sid": subject_id, "title": title, "due": due_date},
-    )
-    lecture_id = int(df.iloc[0]["id"]) if not df.empty else None
+    with conn.session as s:
+        result = s.execute(
+            text(
+                "INSERT INTO lectures (user_id, subject_id, title, due_date) "
+                "VALUES (:uid, :sid, :title, :due) RETURNING id;"
+            ),
+            {"uid": user_id, "sid": subject_id, "title": title, "due": due_date},
+        )
+        lecture_id = result.scalar()
+        s.commit()
+
     if lecture_id and due_date:
         add_event(user_id, "study", subject_id, f"[강의] {title}", due_date, None, None, "", lecture_id=lecture_id)
     return lecture_id
