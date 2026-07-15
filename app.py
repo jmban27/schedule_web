@@ -16,7 +16,7 @@ def home():
 
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
-        st.image("assets/logo.png", use_container_width=True)
+        st.image("images/logo.png", use_container_width=True)
 
     st.markdown(
         "<h1 style='text-align:center;margin-top:0;'>나만의 학습 관리 허브</h1>",
@@ -56,10 +56,10 @@ def home():
 # ============================================================
 pages = [
     st.Page(home, title="Home", icon="🏠", default=True),
-    st.Page("pages/1_공부_시간_기록.py", title="공부 시간 기록", icon="📖"),
-    st.Page("pages/2_일정_관리.py", title="일정 관리", icon="🗓️"),
-    st.Page("pages/3_강의_수강_현황.py", title="강의 수강 현황", icon="🎓"),
-    st.Page("pages/4_학점_관리.py", title="학점 관리", icon="📊"),
+    st.Page("pages/1_study_time.py", title="공부 시간 기록", icon="📖"),
+    st.Page("pages/2_schedule.py", title="일정 관리", icon="🗓️"),
+    st.Page("pages/3_lectures.py", title="강의 수강 현황", icon="🎓"),
+    st.Page("pages/4_credits.py", title="학점 관리", icon="📊"),
 ]
 
 nav = st.navigation(pages)
