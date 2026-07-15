@@ -25,7 +25,7 @@ def home():
     st.markdown(
         "<p style='text-align:center;color:#666;font-size:17px;max-width:640px;margin:0 auto;'>"
         "공부 시간 기록부터 일정 관리, 강의 수강 현황, 졸업 학점 관리까지 — "
-        "학업에 필요한 모든 걸 한 곳에서 관리할 수 있는 개인 학습 관리 앱입니다."
+        "학업에 필요한 모든 걸 한 곳에서 관리할 수 있는 개인 학습 관리 앱입니다아."
         "</p>",
         unsafe_allow_html=True,
     )
