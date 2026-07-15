@@ -4,7 +4,6 @@ import streamlit as st
 
 from common import require_login, sidebar_user_info, run_query, run_write
 
-st.set_page_config(page_title="학점 관리", page_icon="🎓", layout="wide")
 
 user_id, name, authenticator = require_login()
 
