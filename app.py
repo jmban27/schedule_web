@@ -995,6 +995,8 @@ GRADE_OPTIONS = ["(미입력)"] + list(GRADE_POINTS.keys()) + ["P"]
 
 
 CATEGORIES = ["MR", "ME", "CC", "교양"]
+ALL_CATEGORIES = CATEGORIES + ["응통"]
+PIE_COLORS = {"MR": "#7c3aed", "ME": "#0ea5e9", "CC": "#f59e0b", "교양": "#10b981"}
 
 
 def get_credit_settings(user_id: int) -> dict:
@@ -1120,6 +1122,96 @@ def render_course_row(c: pd.Series):
             st.rerun()
 
 
+def render_completion_pie(completed: float, required: float, color: str):
+    if required <= 0:
+        data = pd.DataFrame({"구분": ["목표 미설정"], "값": [1]})
+        return (
+            alt.Chart(data)
+            .mark_arc(innerRadius=45)
+            .encode(theta="값:Q", color=alt.Color("구분:N", scale=alt.Scale(range=["#e5e7eb"]), legend=None))
+            .properties(height=170)
+        )
+    remaining = max(required - completed, 0)
+    data = pd.DataFrame({"구분": ["이수", "미이수"], "값": [completed, remaining]})
+    return (
+        alt.Chart(data)
+        .mark_arc(innerRadius=45)
+        .encode(
+            theta=alt.Theta("값:Q"),
+            color=alt.Color(
+                "구분:N",
+                scale=alt.Scale(domain=["이수", "미이수"], range=[color, "#e5e7eb"]),
+                legend=None,
+            ),
+            tooltip=["구분", "값"],
+        )
+        .properties(height=170)
+    )
+
+
+TIMETABLE_DAYS = ["월", "화", "수", "목", "금", "토"]
+TIMETABLE_HOURS = list(range(9, 20))  # 9~19시 (11칸, 마지막 칸은 19:00~20:00)
+TIMETABLE_PALETTE = ["#7c3aed", "#0ea5e9", "#f59e0b", "#10b981", "#ef4444", "#ec4899", "#6366f1", "#84cc16", "#14b8a6", "#f97316"]
+
+
+def get_timetable_courses(user_id: int) -> pd.DataFrame:
+    return run_query(
+        "SELECT id, name, format, campus, category, credit, day_of_week, start_hour, end_hour, color "
+        "FROM timetable_courses WHERE user_id = :uid ORDER BY created_at;",
+        {"uid": user_id},
+    )
+
+
+def add_timetable_course(user_id: int, name: str, format_: str, campus: str, category: str,
+                          credit: float, day_of_week: str, start_hour: int, end_hour: int):
+    existing_count = run_query(
+        "SELECT COUNT(*) AS c FROM timetable_courses WHERE user_id = :uid;", {"uid": user_id}
+    ).iloc[0]["c"]
+    color = TIMETABLE_PALETTE[int(existing_count) % len(TIMETABLE_PALETTE)]
+    run_write(
+        "INSERT INTO timetable_courses "
+        "(user_id, name, format, campus, category, credit, day_of_week, start_hour, end_hour, color) "
+        "VALUES (:uid, :name, :fmt, :campus, :category, :credit, :day, :sh, :eh, :color);",
+        {
+            "uid": user_id, "name": name, "fmt": format_, "campus": campus, "category": category,
+            "credit": credit, "day": day_of_week, "sh": start_hour, "eh": end_hour, "color": color,
+        },
+    )
+
+
+def delete_timetable_course(course_id: int):
+    run_write("DELETE FROM timetable_courses WHERE id = :id;", {"id": course_id})
+
+
+def render_weekly_timetable_html(courses_df: pd.DataFrame) -> str:
+    html = "<table style='width:100%;border-collapse:collapse;table-layout:fixed;'>"
+    html += "<tr><th style='width:50px;'></th>" + "".join(
+        f"<th style='padding:6px;font-size:12px;color:#666;'>{d}</th>" for d in TIMETABLE_DAYS
+    ) + "</tr>"
+    for h in TIMETABLE_HOURS:
+        html += f"<tr><td style='font-size:11px;color:#999;text-align:right;padding-right:6px;vertical-align:top;'>{h}:00</td>"
+        for d in TIMETABLE_DAYS:
+            match = (
+                courses_df[
+                    (courses_df["day_of_week"] == d)
+                    & (courses_df["start_hour"] <= h)
+                    & (courses_df["end_hour"] > h)
+                ]
+                if not courses_df.empty else pd.DataFrame()
+            )
+            if not match.empty:
+                row = match.iloc[0]
+                html += (
+                    f"<td style='background:{row['color']};color:#fff;font-size:11px;text-align:center;"
+                    f"padding:8px 2px;border:1px solid #fff;overflow:hidden;'>{row['name']}</td>"
+                )
+            else:
+                html += "<td style='background:#fafafa;border:1px solid #eee;height:38px;'></td>"
+        html += "</tr>"
+    html += "</table>"
+    return html
+
+
 def page_credits(user_id: int):
     st.title("🎓 학점 관리")
 
@@ -1163,7 +1255,7 @@ def page_credits(user_id: int):
         with c3:
             course_campus = st.selectbox("캠퍼스", ["신촌", "송도"])
         with c4:
-            course_category = st.selectbox("구분", CATEGORIES)
+            course_category = st.selectbox("구분", ALL_CATEGORIES)
         with c5:
             course_credit = st.selectbox("학점", [0.5, 1, 2, 3])
         submitted = st.form_submit_button("추가")
@@ -1177,8 +1269,8 @@ def page_credits(user_id: int):
     st.subheader("📋 이수 과목 체크리스트")
     courses_df = get_courses(user_id)
 
-    cat_tabs = st.tabs(CATEGORIES)
-    for cat, tab in zip(CATEGORIES, cat_tabs):
+    cat_tabs = st.tabs(ALL_CATEGORIES)
+    for cat, tab in zip(ALL_CATEGORIES, cat_tabs):
         with tab:
             subset = courses_df[courses_df["category"] == cat] if not courses_df.empty else pd.DataFrame()
             if subset.empty:
@@ -1190,22 +1282,28 @@ def page_credits(user_id: int):
                 completed_mask = subset["progress_count"] >= subset["progress_required"]
                 completed_cat = float(subset.loc[completed_mask, "credit"].sum())
 
-            req_cat = required_by_cat[cat]
-            rate_cat = round(completed_cat / req_cat * 100, 1) if req_cat else 0
-            st.caption(f"**{cat} 이수 현황**: {completed_cat} / {req_cat}학점 ({rate_cat}%)")
+            if cat == "응통":
+                st.caption(f"**응통 이수 학점**: {completed_cat}학점 (졸업 필요 학점 계산에는 포함되지 않아요)")
+            else:
+                req_cat = required_by_cat[cat]
+                rate_cat = round(completed_cat / req_cat * 100, 1) if req_cat else 0
+                st.caption(f"**{cat} 이수 현황**: {completed_cat} / {req_cat}학점 ({rate_cat}%)")
 
     st.divider()
 
     # ---- 요약 통계 ----
     st.subheader("📊 이수 현황 요약")
-    if courses_df.empty:
+    grad_df = courses_df[courses_df["category"] != "응통"] if not courses_df.empty else courses_df
+    eung_df = courses_df[courses_df["category"] == "응통"] if not courses_df.empty else courses_df
+
+    if grad_df.empty:
         completed_credits = 0.0
         gpa = 0.0
     else:
-        completed_mask = courses_df["progress_count"] >= courses_df["progress_required"]
-        completed_credits = float(courses_df.loc[completed_mask, "credit"].sum())
+        completed_mask = grad_df["progress_count"] >= grad_df["progress_required"]
+        completed_credits = float(grad_df.loc[completed_mask, "credit"].sum())
 
-        graded = courses_df[courses_df["grade"].isin(GRADE_POINTS.keys())]
+        graded = grad_df[grad_df["grade"].isin(GRADE_POINTS.keys())]
         if not graded.empty:
             weighted_sum = sum(float(r["credit"]) * GRADE_POINTS[r["grade"]] for _, r in graded.iterrows())
             credit_sum = float(graded["credit"].sum())
@@ -1221,6 +1319,128 @@ def page_credits(user_id: int):
     m3.metric("평점 (GPA)", f"{gpa:.2f}")
 
     st.progress(min(1.0, completed_credits / settings["total"]) if settings["total"] else 0)
+
+    st.markdown("**카테고리별 이수율**")
+    pie_cols = st.columns(4)
+    for cat, col in zip(CATEGORIES, pie_cols):
+        subset = grad_df[grad_df["category"] == cat] if not grad_df.empty else pd.DataFrame()
+        completed_cat = (
+            float(subset.loc[subset["progress_count"] >= subset["progress_required"], "credit"].sum())
+            if not subset.empty else 0.0
+        )
+        req_cat = required_by_cat[cat]
+        rate_cat = round(completed_cat / req_cat * 100, 1) if req_cat else 0
+        with col:
+            st.altair_chart(render_completion_pie(completed_cat, req_cat, PIE_COLORS[cat]), use_container_width=True)
+            st.caption(f"**{cat}**: {completed_cat}/{req_cat}학점 ({rate_cat}%)")
+
+    # ---- 응통 (졸업 필요 학점에는 미포함) ----
+    if eung_df.empty:
+        eung_credits = 0.0
+        eung_gpa = 0.0
+    else:
+        eung_completed_mask = eung_df["progress_count"] >= eung_df["progress_required"]
+        eung_credits = float(eung_df.loc[eung_completed_mask, "credit"].sum())
+        eung_graded = eung_df[eung_df["grade"].isin(GRADE_POINTS.keys())]
+        if not eung_graded.empty:
+            eung_weighted = sum(float(r["credit"]) * GRADE_POINTS[r["grade"]] for _, r in eung_graded.iterrows())
+            eung_credit_sum = float(eung_graded["credit"].sum())
+            eung_gpa = eung_weighted / eung_credit_sum if eung_credit_sum else 0.0
+        else:
+            eung_gpa = 0.0
+
+    st.markdown("**응통** (졸업 필요 학점 계산에는 포함되지 않음)")
+    e1, e2 = st.columns(2)
+    e1.metric("응통 이수 학점", f"{eung_credits}학점")
+    e2.metric("응통 GPA", f"{eung_gpa:.2f}")
+
+    st.divider()
+
+    # ============================================================
+    # 시간표 제작 (위의 체크리스트와는 완전히 별개의 과목 목록)
+    # ============================================================
+    st.subheader("🗓️ 시간표 제작")
+    st.caption("이 파트는 위의 이수 체크리스트와 별개로, '이 시간표대로 수강하면 어떻게 되는지' 시뮬레이션하는 공간이에요.")
+
+    with st.form("add_timetable_course_form", clear_on_submit=True):
+        c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.2, 1.2])
+        with c1:
+            tt_name = st.text_input("과목명", key="tt_name")
+        with c2:
+            tt_format = st.selectbox("진행 방식", ["대면", "비대면", "블렌디드"], key="tt_format")
+        with c3:
+            tt_campus = st.selectbox("캠퍼스", ["신촌", "송도"], key="tt_campus")
+        with c4:
+            tt_category = st.selectbox("구분", CATEGORIES, key="tt_category")
+
+        c5, c6, c7, c8 = st.columns([1, 1.4, 1.4, 1.4])
+        with c5:
+            tt_credit = st.selectbox("학점", [0.5, 1, 2, 3], key="tt_credit")
+        with c6:
+            tt_day = st.selectbox("요일", TIMETABLE_DAYS, key="tt_day")
+        with c7:
+            tt_start = st.selectbox("시작 시간", TIMETABLE_HOURS, key="tt_start")
+        with c8:
+            tt_end = st.selectbox("종료 시간", list(range(10, 21)), key="tt_end")
+
+        tt_submitted = st.form_submit_button("➕ 시간표에 추가")
+        if tt_submitted:
+            if not tt_name.strip():
+                st.warning("과목명을 입력해 주세요.")
+            elif tt_end <= tt_start:
+                st.warning("종료 시간이 시작 시간보다 늦어야 합니다.")
+            else:
+                add_timetable_course(
+                    user_id, tt_name.strip(), tt_format, tt_campus, tt_category,
+                    tt_credit, tt_day, tt_start, tt_end,
+                )
+                st.rerun()
+
+    timetable_df = get_timetable_courses(user_id)
+    st.markdown(render_weekly_timetable_html(timetable_df), unsafe_allow_html=True)
+
+    if not timetable_df.empty:
+        st.markdown("**등록된 과목**")
+        for _, row in timetable_df.iterrows():
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(
+                    f"<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
+                    f"background:{row['color']};margin-right:6px;'></span>"
+                    f"{row['name']} · {row['category']} · {row['credit']}학점 · "
+                    f"{row['day_of_week']} {row['start_hour']}:00~{row['end_hour']}:00 · "
+                    f"{row['format']} · {row['campus']}",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button("삭제", key=f"del_tt_{row['id']}"):
+                    delete_timetable_course(row["id"])
+                    st.rerun()
+
+    st.divider()
+
+    # ---- 이 시간표대로 수강했을 때의 예상 이수 현황 ----
+    st.subheader("📊 이 시간표대로 수강하면?")
+
+    if timetable_df.empty:
+        st.info("아직 시간표에 등록된 과목이 없습니다.")
+    else:
+        tt_total = float(timetable_df["credit"].sum())
+        tt_rate_total = round(tt_total / settings["total"] * 100, 1) if settings["total"] else 0
+
+        tm1, tm2 = st.columns(2)
+        tm1.metric("예상 총 이수 학점", f"{tt_total} / {settings['total']}")
+        tm2.metric("예상 총 이수율", f"{tt_rate_total}%")
+
+        st.markdown("**카테고리별 예상 이수율**")
+        tt_pie_cols = st.columns(4)
+        for cat, col in zip(CATEGORIES, tt_pie_cols):
+            cat_credit = float(timetable_df.loc[timetable_df["category"] == cat, "credit"].sum())
+            req_cat = required_by_cat[cat]
+            rate_cat = round(cat_credit / req_cat * 100, 1) if req_cat else 0
+            with col:
+                st.altair_chart(render_completion_pie(cat_credit, req_cat, PIE_COLORS[cat]), use_container_width=True)
+                st.caption(f"**{cat}**: {cat_credit}/{req_cat}학점 ({rate_cat}%)")
 
 
 # ============================================================
