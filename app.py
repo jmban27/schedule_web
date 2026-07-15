@@ -994,21 +994,36 @@ GRADE_POINTS = {
 GRADE_OPTIONS = ["(미입력)"] + list(GRADE_POINTS.keys()) + ["P"]
 
 
-def get_total_required(user_id: int) -> float:
-    df = run_query("SELECT total_required FROM credit_settings WHERE user_id = :uid;", {"uid": user_id})
+CATEGORIES = ["MR", "ME", "CC", "교양"]
+
+
+def get_credit_settings(user_id: int) -> dict:
+    df = run_query(
+        "SELECT total_required, mr_required, me_required, cc_required "
+        "FROM credit_settings WHERE user_id = :uid;",
+        {"uid": user_id},
+    )
     if df.empty:
         run_write(
-            "INSERT INTO credit_settings (user_id, total_required) VALUES (:uid, 130);",
+            "INSERT INTO credit_settings (user_id, total_required, mr_required, me_required, cc_required) "
+            "VALUES (:uid, 130, 0, 0, 0);",
             {"uid": user_id},
         )
-        return 130.0
-    return float(df.iloc[0]["total_required"])
+        return {"total": 130.0, "MR": 0.0, "ME": 0.0, "CC": 0.0}
+    row = df.iloc[0]
+    return {
+        "total": float(row["total_required"]),
+        "MR": float(row["mr_required"]),
+        "ME": float(row["me_required"]),
+        "CC": float(row["cc_required"]),
+    }
 
 
-def update_total_required(user_id: int, value: float):
+def update_credit_settings(user_id: int, total: float, mr: float, me: float, cc: float):
     run_write(
-        "UPDATE credit_settings SET total_required = :v WHERE user_id = :uid;",
-        {"v": value, "uid": user_id},
+        "UPDATE credit_settings SET total_required = :t, mr_required = :mr, "
+        "me_required = :me, cc_required = :cc WHERE user_id = :uid;",
+        {"t": total, "mr": mr, "me": me, "cc": cc, "uid": user_id},
     )
 
 
@@ -1018,25 +1033,27 @@ def ensure_chapel_seed(user_id: int):
     )
     if df.empty:
         run_write(
-            "INSERT INTO credit_courses (user_id, name, format, campus, credit, progress_count, progress_required) "
-            "VALUES (:uid, '채플', '대면', '신촌', 0.5, 0, 4);",
+            "INSERT INTO credit_courses "
+            "(user_id, name, format, campus, category, credit, progress_count, progress_required) "
+            "VALUES (:uid, '채플', '대면', '신촌', 'CC', 0.5, 0, 4);",
             {"uid": user_id},
         )
 
 
 def get_courses(user_id: int) -> pd.DataFrame:
     return run_query(
-        "SELECT id, name, format, campus, credit, grade, progress_count, progress_required "
+        "SELECT id, name, format, campus, category, credit, grade, progress_count, progress_required "
         "FROM credit_courses WHERE user_id = :uid ORDER BY created_at;",
         {"uid": user_id},
     )
 
 
-def add_course(user_id: int, name: str, format_: str, campus: str, credit: float):
+def add_course(user_id: int, name: str, format_: str, campus: str, category: str, credit: float):
     run_write(
-        "INSERT INTO credit_courses (user_id, name, format, campus, credit, progress_count, progress_required) "
-        "VALUES (:uid, :name, :fmt, :campus, :credit, 0, 1);",
-        {"uid": user_id, "name": name, "fmt": format_, "campus": campus, "credit": credit},
+        "INSERT INTO credit_courses "
+        "(user_id, name, format, campus, category, credit, progress_count, progress_required) "
+        "VALUES (:uid, :name, :fmt, :campus, :category, :credit, 0, 1);",
+        {"uid": user_id, "name": name, "fmt": format_, "campus": campus, "category": category, "credit": credit},
     )
 
 
@@ -1052,31 +1069,91 @@ def delete_course(course_id: int):
     run_write("DELETE FROM credit_courses WHERE id = :id;", {"id": course_id})
 
 
+def render_course_row(c: pd.Series):
+    is_multi = c["progress_required"] > 1
+    is_complete = c["progress_count"] >= c["progress_required"]
+
+    col1, col2, col3, col4 = st.columns([3.2, 2, 1.6, 0.8])
+
+    with col1:
+        if is_multi:
+            st.write(f"{'✅' if is_complete else '⬜'} **{c['name']}** ({c['credit']}학점)")
+            st.caption(f"{c['format']} · {c['campus']} · {c['progress_count']}/{c['progress_required']}회 이수")
+        else:
+            checked = st.checkbox(
+                f"{c['name']} ({c['credit']}학점)",
+                value=is_complete,
+                key=f"course_check_{c['id']}",
+            )
+            st.caption(f"{c['format']} · {c['campus']}")
+            if checked != is_complete:
+                update_course_progress(c["id"], 1 if checked else 0)
+                st.rerun()
+
+    with col2:
+        current_grade = c["grade"] if c["grade"] else "(미입력)"
+        grade = st.selectbox(
+            "성적", GRADE_OPTIONS, index=GRADE_OPTIONS.index(current_grade),
+            key=f"grade_{c['id']}", label_visibility="collapsed",
+        )
+        if grade != current_grade:
+            update_course_grade(c["id"], None if grade == "(미입력)" else grade)
+            st.rerun()
+
+    with col3:
+        if is_multi:
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("－", key=f"minus_{c['id']}"):
+                    update_course_progress(c["id"], max(0, c["progress_count"] - 1))
+                    st.rerun()
+            with b2:
+                if st.button("＋", key=f"plus_{c['id']}"):
+                    update_course_progress(c["id"], min(c["progress_required"], c["progress_count"] + 1))
+                    st.rerun()
+
+    with col4:
+        if st.button("삭제", key=f"del_course_{c['id']}"):
+            delete_course(c["id"])
+            st.rerun()
+
+
 def page_credits(user_id: int):
     st.title("🎓 학점 관리")
 
     ensure_chapel_seed(user_id)
-    total_required = get_total_required(user_id)
+    settings = get_credit_settings(user_id)
+    cg_required = max(0.0, settings["total"] - settings["MR"] - settings["ME"] - settings["CC"])
+    required_by_cat = {"MR": settings["MR"], "ME": settings["ME"], "CC": settings["CC"], "교양": cg_required}
 
     st.subheader("🎯 목표 졸업 학점")
-    c1, c2 = st.columns([2, 1])
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        new_total = st.number_input(
-            "총 이수해야 하는 학점", min_value=0.0, value=float(total_required), step=0.5, key="total_required_input"
-        )
+        new_total = st.number_input("총 졸업 학점", min_value=0.0, value=settings["total"], step=0.5, key="total_required_input")
     with c2:
-        st.write("")
-        if st.button("저장", key="save_total_required"):
-            update_total_required(user_id, new_total)
-            st.success("저장되었습니다.")
-            st.rerun()
+        new_mr = st.number_input("MR 학점", min_value=0.0, value=settings["MR"], step=0.5, key="mr_required_input")
+    with c3:
+        new_me = st.number_input("ME 학점", min_value=0.0, value=settings["ME"], step=0.5, key="me_required_input")
+    with c4:
+        new_cc = st.number_input("CC 학점", min_value=0.0, value=settings["CC"], step=0.5, key="cc_required_input")
+
+    computed_cg = new_total - new_mr - new_me - new_cc
+    if computed_cg < 0:
+        st.warning(f"MR+ME+CC 합이 총 졸업학점보다 큽니다. (교양 학점이 {computed_cg}로 음수가 됩니다)")
+    else:
+        st.caption(f"교양 학점(자동 계산) = 총 졸업학점 − (MR+ME+CC) = **{computed_cg}학점**")
+
+    if st.button("저장", key="save_settings"):
+        update_credit_settings(user_id, new_total, new_mr, new_me, new_cc)
+        st.success("저장되었습니다.")
+        st.rerun()
 
     st.divider()
 
     # ---- 과목 추가 ----
     st.subheader("➕ 과목 추가")
     with st.form("add_course_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 1.5])
+        c1, c2, c3, c4, c5 = st.columns([2.5, 1.6, 1.3, 1.3, 1])
         with c1:
             course_name = st.text_input("과목명")
         with c2:
@@ -1084,68 +1161,36 @@ def page_credits(user_id: int):
         with c3:
             course_campus = st.selectbox("캠퍼스", ["신촌", "송도"])
         with c4:
+            course_category = st.selectbox("구분", CATEGORIES)
+        with c5:
             course_credit = st.selectbox("학점", [0.5, 1, 2, 3])
         submitted = st.form_submit_button("추가")
         if submitted and course_name.strip():
-            add_course(user_id, course_name.strip(), course_format, course_campus, course_credit)
+            add_course(user_id, course_name.strip(), course_format, course_campus, course_category, course_credit)
             st.rerun()
 
     st.divider()
 
-    # ---- 체크리스트 ----
+    # ---- 체크리스트 (카테고리별 탭) ----
     st.subheader("📋 이수 과목 체크리스트")
     courses_df = get_courses(user_id)
 
-    if courses_df.empty:
-        st.info("아직 등록된 과목이 없습니다.")
-    else:
-        for _, c in courses_df.iterrows():
-            is_multi = c["progress_required"] > 1
-            is_complete = c["progress_count"] >= c["progress_required"]
+    cat_tabs = st.tabs(CATEGORIES)
+    for cat, tab in zip(CATEGORIES, cat_tabs):
+        with tab:
+            subset = courses_df[courses_df["category"] == cat] if not courses_df.empty else pd.DataFrame()
+            if subset.empty:
+                st.caption("등록된 과목이 없습니다.")
+                completed_cat = 0.0
+            else:
+                for _, c in subset.iterrows():
+                    render_course_row(c)
+                completed_mask = subset["progress_count"] >= subset["progress_required"]
+                completed_cat = float(subset.loc[completed_mask, "credit"].sum())
 
-            col1, col2, col3, col4 = st.columns([3.2, 2, 1.6, 0.8])
-
-            with col1:
-                if is_multi:
-                    st.write(f"{'✅' if is_complete else '⬜'} **{c['name']}** ({c['credit']}학점)")
-                    st.caption(f"{c['format']} · {c['campus']} · {c['progress_count']}/{c['progress_required']}회 이수")
-                else:
-                    checked = st.checkbox(
-                        f"{c['name']} ({c['credit']}학점)",
-                        value=is_complete,
-                        key=f"course_check_{c['id']}",
-                    )
-                    st.caption(f"{c['format']} · {c['campus']}")
-                    if checked != is_complete:
-                        update_course_progress(c["id"], 1 if checked else 0)
-                        st.rerun()
-
-            with col2:
-                current_grade = c["grade"] if c["grade"] else "(미입력)"
-                grade = st.selectbox(
-                    "성적", GRADE_OPTIONS, index=GRADE_OPTIONS.index(current_grade),
-                    key=f"grade_{c['id']}", label_visibility="collapsed",
-                )
-                if grade != current_grade:
-                    update_course_grade(c["id"], None if grade == "(미입력)" else grade)
-                    st.rerun()
-
-            with col3:
-                if is_multi:
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        if st.button("－", key=f"minus_{c['id']}"):
-                            update_course_progress(c["id"], max(0, c["progress_count"] - 1))
-                            st.rerun()
-                    with b2:
-                        if st.button("＋", key=f"plus_{c['id']}"):
-                            update_course_progress(c["id"], min(c["progress_required"], c["progress_count"] + 1))
-                            st.rerun()
-
-            with col4:
-                if st.button("삭제", key=f"del_course_{c['id']}"):
-                    delete_course(c["id"])
-                    st.rerun()
+            req_cat = required_by_cat[cat]
+            rate_cat = round(completed_cat / req_cat * 100, 1) if req_cat else 0
+            st.caption(f"**{cat} 이수 현황**: {completed_cat} / {req_cat}학점 ({rate_cat}%)")
 
     st.divider()
 
@@ -1166,14 +1211,14 @@ def page_credits(user_id: int):
         else:
             gpa = 0.0
 
-    completion_rate = round(completed_credits / total_required * 100, 1) if total_required else 0
+    completion_rate = round(completed_credits / settings["total"] * 100, 1) if settings["total"] else 0
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("이수 학점", f"{completed_credits} / {total_required}")
+    m1.metric("이수 학점", f"{completed_credits} / {settings['total']}")
     m2.metric("완성율", f"{completion_rate}%")
     m3.metric("평점 (GPA)", f"{gpa:.2f}")
 
-    st.progress(min(1.0, completed_credits / total_required) if total_required else 0)
+    st.progress(min(1.0, completed_credits / settings["total"]) if settings["total"] else 0)
 
 
 # ============================================================
