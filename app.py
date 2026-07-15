@@ -1092,6 +1092,8 @@ def render_course_row(c: pd.Series):
 
     with col2:
         current_grade = c["grade"] if c["grade"] else "(미입력)"
+        if current_grade not in GRADE_OPTIONS:
+            current_grade = "(미입력)"
         grade = st.selectbox(
             "성적", GRADE_OPTIONS, index=GRADE_OPTIONS.index(current_grade),
             key=f"grade_{c['id']}", label_visibility="collapsed",
