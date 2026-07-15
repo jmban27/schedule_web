@@ -10,7 +10,6 @@ from common import (
     get_subjects, get_overdue_lectures, add_event,
 )
 
-st.set_page_config(page_title="일정 관리", page_icon="🗓️", layout="wide")
 
 user_id, name, authenticator = require_login()
 
