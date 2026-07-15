@@ -8,7 +8,6 @@ from sqlalchemy import text
 
 from common import require_login, sidebar_user_info, run_query, run_write, get_subjects, conn
 
-st.set_page_config(page_title="공부 시간 기록", page_icon="📖", layout="wide")
 
 user_id, name, authenticator = require_login()
 
