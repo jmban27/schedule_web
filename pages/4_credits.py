@@ -469,20 +469,29 @@ def page_credits(user_id: int):
 
     if not timetable_df.empty:
         st.markdown("**등록된 과목**")
-        for _, row in timetable_df.iterrows():
+        day_order = {d: i for i, d in enumerate(TIMETABLE_DAYS)}
+        for name, group in timetable_df.groupby("name", sort=False):
+            first = group.iloc[0]
+            sorted_group = group.sort_values(
+                by=["day_of_week", "start_hour"],
+                key=lambda col: col.map(day_order) if col.name == "day_of_week" else col,
+            )
+            time_str = ", ".join(
+                f"{r['day_of_week']} {r['start_hour']}:00~{r['end_hour']}:00" for _, r in sorted_group.iterrows()
+            )
             c1, c2 = st.columns([5, 1])
             with c1:
                 st.markdown(
                     f"<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
-                    f"background:{row['color']};margin-right:6px;'></span>"
-                    f"{row['name']} · {row['category']} · {row['credit']}학점 · "
-                    f"{row['day_of_week']} {row['start_hour']}:00~{row['end_hour']}:00 · "
-                    f"{row['format']} · {row['campus']}",
+                    f"background:{first['color']};margin-right:6px;'></span>"
+                    f"{name} · {first['category']} · {first['credit']}학점 · "
+                    f"{time_str} · {first['format']} · {first['campus']}",
                     unsafe_allow_html=True,
                 )
             with c2:
-                if st.button("삭제", key=f"del_tt_{row['id']}"):
-                    delete_timetable_course(row["id"])
+                if st.button("삭제", key=f"del_tt_{name}"):
+                    for course_id in group["id"]:
+                        delete_timetable_course(course_id)
                     st.rerun()
 
     st.divider()
