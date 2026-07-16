@@ -25,6 +25,77 @@ def run_write(query: str, params: dict | None = None):
         s.commit()
 
 
+def run_write_returning_id(query: str, params: dict | None = None) -> int:
+    """INSERT ... RETURNING id 전용. 커밋까지 확실히 처리하고 새로 생긴 id를 반환합니다."""
+    with conn.session as s:
+        result = s.execute(text(query), params or {})
+        new_id = result.scalar()
+        s.commit()
+    return int(new_id)
+
+
+# ============================================================
+# 세션 캐시 (같은 세션 안에서는 DB를 매번 다시 조회하지 않도록)
+# - 쓰기(추가/수정/삭제)는 여전히 즉시 DB에 반영되어 안전합니다.
+# - 대신 메모리 상의 캐시도 같이 업데이트해서, DB를 다시 읽어오는
+#   왕복을 없애고 화면이 훨씬 빠르게 반응하도록 합니다.
+# ============================================================
+def _cache_store() -> dict:
+    return st.session_state.setdefault("_cache", {})
+
+
+def cached_query(key: str, query: str, params: dict | None = None) -> pd.DataFrame:
+    """캐시에 있으면 그대로 반환, 없으면 DB에서 가져와 캐시에 저장 후 반환."""
+    store = _cache_store()
+    if key not in store:
+        store[key] = run_query(query, params)
+    return store[key]
+
+
+def get_cache(key: str) -> pd.DataFrame | None:
+    return _cache_store().get(key)
+
+
+def set_cache(key: str, df: pd.DataFrame):
+    _cache_store()[key] = df
+
+
+def invalidate_cache(key: str):
+    _cache_store().pop(key, None)
+
+
+def cache_append_row(key: str, row: dict):
+    store = _cache_store()
+    new_row_df = pd.DataFrame([row])
+    if key in store and not store[key].empty:
+        store[key] = pd.concat([store[key], new_row_df], ignore_index=True)
+    else:
+        store[key] = new_row_df
+
+
+def cache_update_row(key: str, id_col: str, id_value, updates: dict):
+    store = _cache_store()
+    df = store.get(key)
+    if df is not None and not df.empty:
+        mask = df[id_col] == id_value
+        for col, val in updates.items():
+            df.loc[mask, col] = val
+
+
+def cache_delete_row(key: str, id_col: str, id_value):
+    store = _cache_store()
+    df = store.get(key)
+    if df is not None and not df.empty:
+        store[key] = df[df[id_col] != id_value].reset_index(drop=True)
+
+
+def cache_delete_rows(key: str, id_col: str, id_values):
+    store = _cache_store()
+    df = store.get(key)
+    if df is not None and not df.empty:
+        store[key] = df[~df[id_col].isin(list(id_values))].reset_index(drop=True)
+
+
 # ============================================================
 # 로그인
 # ============================================================
@@ -88,7 +159,8 @@ def sidebar_user_info(name: str, authenticator):
 # 공통: 과목(subjects) — 공부 시간 기록 / 일정 관리 / 강의 수강 현황에서 함께 사용
 # ============================================================
 def get_subjects(user_id: int) -> pd.DataFrame:
-    return run_query(
+    return cached_query(
+        f"subjects_{user_id}",
         "SELECT id, name, color FROM subjects WHERE user_id = :uid ORDER BY name;",
         {"uid": user_id},
     )
