@@ -191,10 +191,16 @@ def get_timetable_courses(user_id: int) -> pd.DataFrame:
 
 def add_timetable_course(user_id: int, name: str, format_: str, campus: str, category: str,
                           credit: float, day_of_week: str, start_hour: int, end_hour: int):
-    existing_count = run_query(
-        "SELECT COUNT(*) AS c FROM timetable_courses WHERE user_id = :uid;", {"uid": user_id}
-    ).iloc[0]["c"]
-    color = TIMETABLE_PALETTE[int(existing_count) % len(TIMETABLE_PALETTE)]
+    existing = run_query(
+        "SELECT DISTINCT name, color FROM timetable_courses WHERE user_id = :uid;", {"uid": user_id}
+    )
+    match = existing[existing["name"] == name] if not existing.empty else existing
+    if not match.empty:
+        color = match.iloc[0]["color"]
+    else:
+        distinct_count = int(existing["name"].nunique()) if not existing.empty else 0
+        color = TIMETABLE_PALETTE[distinct_count % len(TIMETABLE_PALETTE)]
+
     run_write(
         "INSERT INTO timetable_courses "
         "(user_id, name, format, campus, category, credit, day_of_week, start_hour, end_hour, color) "
@@ -330,9 +336,12 @@ def page_credits(user_id: int):
         completed_mask = grad_df["progress_count"] >= grad_df["progress_required"]
         completed_credits = float(grad_df.loc[completed_mask, "credit"].sum())
 
-        graded = grad_df[grad_df["grade"].isin(GRADE_POINTS.keys())]
+        grad_grade_clean = grad_df["grade"].astype(str).str.strip()
+        graded = grad_df[grad_grade_clean.isin(GRADE_POINTS.keys())]
         if not graded.empty:
-            weighted_sum = sum(float(r["credit"]) * GRADE_POINTS[r["grade"]] for _, r in graded.iterrows())
+            weighted_sum = sum(
+                float(r["credit"]) * GRADE_POINTS[str(r["grade"]).strip()] for _, r in graded.iterrows()
+            )
             credit_sum = float(graded["credit"].sum())
             gpa = weighted_sum / credit_sum if credit_sum else 0.0
         else:
@@ -361,25 +370,34 @@ def page_credits(user_id: int):
             st.altair_chart(render_completion_pie(completed_cat, req_cat, PIE_COLORS[cat]), use_container_width=True)
             st.caption(f"**{cat}**: {completed_cat}/{req_cat}학점 ({rate_cat}%)")
 
-    # ---- 응통 (졸업 필요 학점에는 미포함) ----
+    # ---- 응통 (졸업 필요 학점 자체 계산에는 미포함, 대신 포함 시 결과를 별도로 보여줌) ----
+    eung_graded = pd.DataFrame()
     if eung_df.empty:
         eung_credits = 0.0
         eung_gpa = 0.0
     else:
         eung_completed_mask = eung_df["progress_count"] >= eung_df["progress_required"]
         eung_credits = float(eung_df.loc[eung_completed_mask, "credit"].sum())
-        eung_graded = eung_df[eung_df["grade"].isin(GRADE_POINTS.keys())]
+
+        eung_grade_clean = eung_df["grade"].astype(str).str.strip()
+        eung_graded = eung_df[eung_grade_clean.isin(GRADE_POINTS.keys())]
         if not eung_graded.empty:
-            eung_weighted = sum(float(r["credit"]) * GRADE_POINTS[r["grade"]] for _, r in eung_graded.iterrows())
+            eung_weighted = sum(
+                float(r["credit"]) * GRADE_POINTS[str(r["grade"]).strip()] for _, r in eung_graded.iterrows()
+            )
             eung_credit_sum = float(eung_graded["credit"].sum())
             eung_gpa = eung_weighted / eung_credit_sum if eung_credit_sum else 0.0
         else:
             eung_gpa = 0.0
 
-    st.markdown("**응통** (졸업 필요 학점 계산에는 포함되지 않음)")
-    e1, e2 = st.columns(2)
+    combined_credits = completed_credits + eung_credits
+    combined_rate = round(combined_credits / settings["total"] * 100, 1) if settings["total"] else 0
+
+    st.markdown("**응통** (졸업 필요 학점 자체 계산에는 포함되지 않지만, 포함했을 때 결과를 아래에서 확인할 수 있어요)")
+    e1, e2, e3 = st.columns(3)
     e1.metric("응통 이수 학점", f"{eung_credits}학점")
-    e2.metric("응통 GPA", f"{eung_gpa:.2f}")
+    e2.metric("응통 GPA", f"{eung_gpa:.2f}" if not eung_graded.empty else "성적 미입력" if not eung_df.empty else "-")
+    e3.metric("응통 포함 시 총 이수 학점", f"{combined_credits} / {settings['total']} ({combined_rate}%)")
 
     st.divider()
 
