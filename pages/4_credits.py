@@ -1,8 +1,13 @@
 import altair as alt
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
 
-from common import require_login, sidebar_user_info, run_query, run_write
+from common import (
+    require_login, sidebar_user_info, run_query, run_write, run_write_returning_id, conn,
+    cached_query, get_cache, set_cache, cache_append_row, cache_update_row,
+    cache_delete_row, cache_delete_rows,
+)
 
 
 user_id, name, authenticator = require_login()
@@ -27,6 +32,11 @@ PIE_COLORS = {"MR": "#7c3aed", "ME": "#0ea5e9", "CC": "#f59e0b", "교양": "#10b
 
 
 def get_credit_settings(user_id: int) -> dict:
+    cache_key = f"credit_settings_{user_id}"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+
     df = run_query(
         "SELECT total_required, mr_required, me_required, cc_required "
         "FROM credit_settings WHERE user_id = :uid;",
@@ -38,14 +48,17 @@ def get_credit_settings(user_id: int) -> dict:
             "VALUES (:uid, 130, 0, 0, 0);",
             {"uid": user_id},
         )
-        return {"total": 130.0, "MR": 0.0, "ME": 0.0, "CC": 0.0}
-    row = df.iloc[0]
-    return {
-        "total": float(row["total_required"]),
-        "MR": float(row["mr_required"]),
-        "ME": float(row["me_required"]),
-        "CC": float(row["cc_required"]),
-    }
+        settings = {"total": 130.0, "MR": 0.0, "ME": 0.0, "CC": 0.0}
+    else:
+        row = df.iloc[0]
+        settings = {
+            "total": float(row["total_required"]),
+            "MR": float(row["mr_required"]),
+            "ME": float(row["me_required"]),
+            "CC": float(row["cc_required"]),
+        }
+    set_cache(cache_key, settings)
+    return settings
 
 
 def update_credit_settings(user_id: int, total: float, mr: float, me: float, cc: float):
@@ -54,51 +67,70 @@ def update_credit_settings(user_id: int, total: float, mr: float, me: float, cc:
         "me_required = :me, cc_required = :cc WHERE user_id = :uid;",
         {"t": total, "mr": mr, "me": me, "cc": cc, "uid": user_id},
     )
-
-
-def ensure_chapel_seed(user_id: int):
-    df = run_query(
-        "SELECT id FROM credit_courses WHERE user_id = :uid AND name = '채플';", {"uid": user_id}
-    )
-    if df.empty:
-        run_write(
-            "INSERT INTO credit_courses "
-            "(user_id, name, format, campus, category, credit, progress_count, progress_required) "
-            "VALUES (:uid, '채플', '대면', '신촌', 'CC', 0.5, 0, 4);",
-            {"uid": user_id},
-        )
+    set_cache(f"credit_settings_{user_id}", {"total": total, "MR": mr, "ME": me, "CC": cc})
 
 
 def get_courses(user_id: int) -> pd.DataFrame:
-    return run_query(
+    return cached_query(
+        f"courses_{user_id}",
         "SELECT id, name, format, campus, category, credit, grade, progress_count, progress_required "
         "FROM credit_courses WHERE user_id = :uid ORDER BY created_at;",
         {"uid": user_id},
     )
 
 
-def add_course(user_id: int, name: str, format_: str, campus: str, category: str, credit: float):
-    run_write(
+def ensure_chapel_seed(user_id: int):
+    courses_df = get_courses(user_id)
+    if not courses_df.empty and (courses_df["name"] == "채플").any():
+        return
+
+    new_id = run_write_returning_id(
         "INSERT INTO credit_courses "
         "(user_id, name, format, campus, category, credit, progress_count, progress_required) "
-        "VALUES (:uid, :name, :fmt, :campus, :category, :credit, 0, 1);",
-        {"uid": user_id, "name": name, "fmt": format_, "campus": campus, "category": category, "credit": credit},
+        "VALUES (:uid, '채플', '대면', '신촌', 'CC', 0.5, 0, 4) RETURNING id;",
+        {"uid": user_id},
+    )
+    cache_append_row(
+        f"courses_{user_id}",
+        {
+            "id": new_id, "name": "채플", "format": "대면", "campus": "신촌", "category": "CC",
+            "credit": 0.5, "grade": None, "progress_count": 0, "progress_required": 4,
+        },
     )
 
 
-def update_course_progress(course_id: int, new_count: int):
+def add_course(user_id: int, name: str, format_: str, campus: str, category: str, credit: float):
+    new_id = run_write_returning_id(
+        "INSERT INTO credit_courses "
+        "(user_id, name, format, campus, category, credit, progress_count, progress_required) "
+        "VALUES (:uid, :name, :fmt, :campus, :category, :credit, 0, 1) RETURNING id;",
+        {"uid": user_id, "name": name, "fmt": format_, "campus": campus, "category": category, "credit": credit},
+    )
+    cache_append_row(
+        f"courses_{user_id}",
+        {
+            "id": new_id, "name": name, "format": format_, "campus": campus, "category": category,
+            "credit": credit, "grade": None, "progress_count": 0, "progress_required": 1,
+        },
+    )
+
+
+def update_course_progress(user_id: int, course_id: int, new_count: int):
     run_write("UPDATE credit_courses SET progress_count = :v WHERE id = :id;", {"v": new_count, "id": course_id})
+    cache_update_row(f"courses_{user_id}", "id", course_id, {"progress_count": new_count})
 
 
-def update_course_grade(course_id: int, grade):
+def update_course_grade(user_id: int, course_id: int, grade):
     run_write("UPDATE credit_courses SET grade = :g WHERE id = :id;", {"g": grade, "id": course_id})
+    cache_update_row(f"courses_{user_id}", "id", course_id, {"grade": grade})
 
 
-def delete_course(course_id: int):
+def delete_course(user_id: int, course_id: int):
     run_write("DELETE FROM credit_courses WHERE id = :id;", {"id": course_id})
+    cache_delete_row(f"courses_{user_id}", "id", course_id)
 
 
-def render_course_row(c: pd.Series):
+def render_course_row(user_id: int, c: pd.Series):
     is_multi = c["progress_required"] > 1
     is_complete = c["progress_count"] >= c["progress_required"]
 
@@ -116,8 +148,7 @@ def render_course_row(c: pd.Series):
             )
             st.caption(f"{c['format']} · {c['campus']}")
             if checked != is_complete:
-                update_course_progress(c["id"], 1 if checked else 0)
-                st.rerun()
+                update_course_progress(user_id, c["id"], 1 if checked else 0)
 
     with col2:
         current_grade = c["grade"] if c["grade"] else "(미입력)"
@@ -128,25 +159,21 @@ def render_course_row(c: pd.Series):
             key=f"grade_{c['id']}", label_visibility="collapsed",
         )
         if grade != current_grade:
-            update_course_grade(c["id"], None if grade == "(미입력)" else grade)
-            st.rerun()
+            update_course_grade(user_id, c["id"], None if grade == "(미입력)" else grade)
 
     with col3:
         if is_multi:
             b1, b2 = st.columns(2)
             with b1:
                 if st.button("－", key=f"minus_{c['id']}"):
-                    update_course_progress(c["id"], max(0, c["progress_count"] - 1))
-                    st.rerun()
+                    update_course_progress(user_id, c["id"], max(0, c["progress_count"] - 1))
             with b2:
                 if st.button("＋", key=f"plus_{c['id']}"):
-                    update_course_progress(c["id"], min(c["progress_required"], c["progress_count"] + 1))
-                    st.rerun()
+                    update_course_progress(user_id, c["id"], min(c["progress_required"], c["progress_count"] + 1))
 
     with col4:
         if st.button("삭제", key=f"del_course_{c['id']}"):
-            delete_course(c["id"])
-            st.rerun()
+            delete_course(user_id, c["id"])
 
 
 def render_completion_pie(completed: float, required: float, color: str):
@@ -182,7 +209,8 @@ TIMETABLE_PALETTE = ["#7c3aed", "#0ea5e9", "#f59e0b", "#10b981", "#ef4444", "#ec
 
 
 def get_timetable_courses(user_id: int) -> pd.DataFrame:
-    return run_query(
+    return cached_query(
+        f"timetable_{user_id}",
         "SELECT id, name, format, campus, category, credit, day_of_week, start_hour, end_hour, color "
         "FROM timetable_courses WHERE user_id = :uid ORDER BY created_at;",
         {"uid": user_id},
@@ -191,9 +219,7 @@ def get_timetable_courses(user_id: int) -> pd.DataFrame:
 
 def add_timetable_course(user_id: int, name: str, format_: str, campus: str, category: str,
                           credit: float, day_of_week: str, start_hour: int, end_hour: int):
-    existing = run_query(
-        "SELECT DISTINCT name, color FROM timetable_courses WHERE user_id = :uid;", {"uid": user_id}
-    )
+    existing = get_timetable_courses(user_id)
     match = existing[existing["name"] == name] if not existing.empty else existing
     if not match.empty:
         color = match.iloc[0]["color"]
@@ -201,19 +227,37 @@ def add_timetable_course(user_id: int, name: str, format_: str, campus: str, cat
         distinct_count = int(existing["name"].nunique()) if not existing.empty else 0
         color = TIMETABLE_PALETTE[distinct_count % len(TIMETABLE_PALETTE)]
 
-    run_write(
+    new_id = run_write_returning_id(
         "INSERT INTO timetable_courses "
         "(user_id, name, format, campus, category, credit, day_of_week, start_hour, end_hour, color) "
-        "VALUES (:uid, :name, :fmt, :campus, :category, :credit, :day, :sh, :eh, :color);",
+        "VALUES (:uid, :name, :fmt, :campus, :category, :credit, :day, :sh, :eh, :color) RETURNING id;",
         {
             "uid": user_id, "name": name, "fmt": format_, "campus": campus, "category": category,
             "credit": credit, "day": day_of_week, "sh": start_hour, "eh": end_hour, "color": color,
         },
     )
+    cache_append_row(
+        f"timetable_{user_id}",
+        {
+            "id": new_id, "name": name, "format": format_, "campus": campus, "category": category,
+            "credit": credit, "day_of_week": day_of_week, "start_hour": start_hour,
+            "end_hour": end_hour, "color": color,
+        },
+    )
 
 
-def delete_timetable_course(course_id: int):
+def delete_timetable_course(user_id: int, course_id: int):
     run_write("DELETE FROM timetable_courses WHERE id = :id;", {"id": course_id})
+    cache_delete_row(f"timetable_{user_id}", "id", course_id)
+
+
+def delete_timetable_courses(user_id: int, course_ids):
+    course_ids = list(course_ids)
+    with conn.session as s:
+        for cid in course_ids:
+            s.execute(text("DELETE FROM timetable_courses WHERE id = :id;"), {"id": int(cid)})
+        s.commit()
+    cache_delete_rows(f"timetable_{user_id}", "id", course_ids)
 
 
 def render_weekly_timetable_html(courses_df: pd.DataFrame) -> str:
@@ -294,7 +338,6 @@ def page_credits(user_id: int):
         submitted = st.form_submit_button("추가")
         if submitted and course_name.strip():
             add_course(user_id, course_name.strip(), course_format, course_campus, course_category, course_credit)
-            st.rerun()
 
     st.divider()
 
@@ -308,12 +351,17 @@ def page_credits(user_id: int):
             subset = courses_df[courses_df["category"] == cat] if not courses_df.empty else pd.DataFrame()
             if subset.empty:
                 st.caption("등록된 과목이 없습니다.")
-                completed_cat = 0.0
             else:
                 for _, c in subset.iterrows():
-                    render_course_row(c)
-                completed_mask = subset["progress_count"] >= subset["progress_required"]
-                completed_cat = float(subset.loc[completed_mask, "credit"].sum())
+                    render_course_row(user_id, c)
+
+            # 위에서 체크/성적/삭제로 방금 캐시가 바뀌었을 수 있으니, 통계는 최신 courses_df 기준으로 다시 계산
+            fresh_subset = courses_df[courses_df["category"] == cat] if not courses_df.empty else pd.DataFrame()
+            if fresh_subset.empty:
+                completed_cat = 0.0
+            else:
+                completed_mask = fresh_subset["progress_count"] >= fresh_subset["progress_required"]
+                completed_cat = float(fresh_subset.loc[completed_mask, "credit"].sum())
 
             if cat == "응통":
                 st.caption(f"**응통 이수 학점**: {completed_cat}학점 (졸업 필요 학점 계산에는 포함되지 않아요)")
@@ -462,7 +510,6 @@ def page_credits(user_id: int):
                         user_id, tt_name.strip(), tt_format, tt_campus, tt_category,
                         tt_credit, tt_day2, tt_start2, tt_end2,
                     )
-                st.rerun()
 
     timetable_df = get_timetable_courses(user_id)
     st.markdown(render_weekly_timetable_html(timetable_df), unsafe_allow_html=True)
@@ -490,8 +537,7 @@ def page_credits(user_id: int):
                 )
             with c2:
                 if st.button("삭제", key=f"del_tt_{name}"):
-                    for course_id in group["id"]:
-                        delete_timetable_course(course_id)
+                    delete_timetable_courses(user_id, group["id"].tolist())
                     st.rerun()
 
     st.divider()
