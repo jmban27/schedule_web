@@ -418,27 +418,50 @@ def page_credits(user_id: int):
         with c4:
             tt_category = st.selectbox("구분", CATEGORIES, key="tt_category")
 
-        c5, c6, c7, c8 = st.columns([1, 1.4, 1.4, 1.4])
+        c5, = st.columns(1)
         with c5:
             tt_credit = st.selectbox("학점", [0.5, 1, 2, 3], key="tt_credit")
+
+        st.markdown("**시간 블록 1** (필수)")
+        c6, c7, c8 = st.columns(3)
         with c6:
-            tt_day = st.selectbox("요일", TIMETABLE_DAYS, key="tt_day")
+            tt_day1 = st.selectbox("요일", TIMETABLE_DAYS, key="tt_day1")
         with c7:
-            tt_start = st.selectbox("시작 시간", TIMETABLE_HOURS, key="tt_start")
+            tt_start1 = st.selectbox("시작 시간", TIMETABLE_HOURS, key="tt_start1")
         with c8:
-            tt_end = st.selectbox("종료 시간", list(range(10, 21)), key="tt_end")
+            tt_end1 = st.selectbox("종료 시간", list(range(10, 21)), key="tt_end1")
+
+        tt_add_slot2 = st.checkbox("요일/시간 블록을 하나 더 추가 (예: 주 2회 수업)", key="tt_add_slot2")
+
+        tt_day2 = tt_start2 = tt_end2 = None
+        if tt_add_slot2:
+            st.markdown("**시간 블록 2**")
+            c9, c10, c11 = st.columns(3)
+            with c9:
+                tt_day2 = st.selectbox("요일 ", TIMETABLE_DAYS, key="tt_day2")
+            with c10:
+                tt_start2 = st.selectbox("시작 시간 ", TIMETABLE_HOURS, key="tt_start2")
+            with c11:
+                tt_end2 = st.selectbox("종료 시간 ", list(range(10, 21)), key="tt_end2")
 
         tt_submitted = st.form_submit_button("➕ 시간표에 추가")
         if tt_submitted:
             if not tt_name.strip():
                 st.warning("과목명을 입력해 주세요.")
-            elif tt_end <= tt_start:
-                st.warning("종료 시간이 시작 시간보다 늦어야 합니다.")
+            elif tt_end1 <= tt_start1:
+                st.warning("시간 블록 1의 종료 시간이 시작 시간보다 늦어야 합니다.")
+            elif tt_add_slot2 and tt_end2 <= tt_start2:
+                st.warning("시간 블록 2의 종료 시간이 시작 시간보다 늦어야 합니다.")
             else:
                 add_timetable_course(
                     user_id, tt_name.strip(), tt_format, tt_campus, tt_category,
-                    tt_credit, tt_day, tt_start, tt_end,
+                    tt_credit, tt_day1, tt_start1, tt_end1,
                 )
+                if tt_add_slot2:
+                    add_timetable_course(
+                        user_id, tt_name.strip(), tt_format, tt_campus, tt_category,
+                        tt_credit, tt_day2, tt_start2, tt_end2,
+                    )
                 st.rerun()
 
     timetable_df = get_timetable_courses(user_id)
@@ -466,26 +489,41 @@ def page_credits(user_id: int):
 
     # ---- 이 시간표대로 수강했을 때의 예상 이수 현황 ----
     st.subheader("📊 이 시간표대로 수강하면?")
+    st.caption("위 '이수 현황 요약'에서 이미 이수 처리한 학점 + 이 시간표에 등록한 과목 학점을 합산해서 보여줘요.")
 
     if timetable_df.empty:
         st.info("아직 시간표에 등록된 과목이 없습니다.")
     else:
-        tt_total = float(timetable_df["credit"].sum())
-        tt_rate_total = round(tt_total / settings["total"] * 100, 1) if settings["total"] else 0
+        # 같은 과목이 여러 요일(시간 블록)에 걸쳐 등록되어 있어도 학점은 한 번만 계산
+        unique_tt = timetable_df.drop_duplicates(subset="name")[["name", "category", "credit"]]
+
+        tt_total = float(unique_tt["credit"].sum())
+        combined_total = completed_credits + tt_total
+        combined_rate = round(combined_total / settings["total"] * 100, 1) if settings["total"] else 0
 
         tm1, tm2 = st.columns(2)
-        tm1.metric("예상 총 이수 학점", f"{tt_total} / {settings['total']}")
-        tm2.metric("예상 총 이수율", f"{tt_rate_total}%")
+        tm1.metric("예상 총 이수 학점 (기존 이수 + 시간표)", f"{combined_total} / {settings['total']}")
+        tm2.metric("예상 총 이수율", f"{combined_rate}%")
 
-        st.markdown("**카테고리별 예상 이수율**")
+        st.markdown("**카테고리별 예상 이수율** (기존 이수 + 시간표 합산)")
         tt_pie_cols = st.columns(4)
         for cat, col in zip(CATEGORIES, tt_pie_cols):
-            cat_credit = float(timetable_df.loc[timetable_df["category"] == cat, "credit"].sum())
+            existing_cat_credit = (
+                float(
+                    grad_df.loc[
+                        (grad_df["category"] == cat) & (grad_df["progress_count"] >= grad_df["progress_required"]),
+                        "credit",
+                    ].sum()
+                )
+                if not grad_df.empty else 0.0
+            )
+            tt_cat_credit = float(unique_tt.loc[unique_tt["category"] == cat, "credit"].sum())
+            combined_cat = existing_cat_credit + tt_cat_credit
             req_cat = required_by_cat[cat]
-            rate_cat = round(cat_credit / req_cat * 100, 1) if req_cat else 0
+            rate_cat = round(combined_cat / req_cat * 100, 1) if req_cat else 0
             with col:
-                st.altair_chart(render_completion_pie(cat_credit, req_cat, PIE_COLORS[cat]), use_container_width=True)
-                st.caption(f"**{cat}**: {cat_credit}/{req_cat}학점 ({rate_cat}%)")
+                st.altair_chart(render_completion_pie(combined_cat, req_cat, PIE_COLORS[cat]), use_container_width=True)
+                st.caption(f"**{cat}**: {combined_cat}/{req_cat}학점 ({rate_cat}%)")
 
 
 page_credits(user_id)
