@@ -407,6 +407,8 @@ def page_credits(user_id: int):
     st.subheader("🗓️ 시간표 제작")
     st.caption("이 파트는 위의 이수 체크리스트와 별개로, '이 시간표대로 수강하면 어떻게 되는지' 시뮬레이션하는 공간이에요.")
 
+    tt_add_slot2 = st.checkbox("요일/시간 블록을 하나 더 추가 (예: 주 2회 수업)", key="tt_add_slot2")
+
     with st.form("add_timetable_course_form", clear_on_submit=True):
         c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.2, 1.2])
         with c1:
@@ -430,8 +432,6 @@ def page_credits(user_id: int):
             tt_start1 = st.selectbox("시작 시간", TIMETABLE_HOURS, key="tt_start1")
         with c8:
             tt_end1 = st.selectbox("종료 시간", list(range(10, 21)), key="tt_end1")
-
-        tt_add_slot2 = st.checkbox("요일/시간 블록을 하나 더 추가 (예: 주 2회 수업)", key="tt_add_slot2")
 
         tt_day2 = tt_start2 = tt_end2 = None
         if tt_add_slot2:
