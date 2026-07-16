@@ -6,8 +6,9 @@ import pandas as pd
 import streamlit as st
 
 from common import (
-    require_login, sidebar_user_info, run_query, run_write,
+    require_login, sidebar_user_info, run_write, run_write_returning_id,
     get_subjects, get_overdue_lectures, add_event,
+    cached_query, cache_append_row, cache_update_row, cache_delete_row,
 )
 
 
@@ -18,7 +19,8 @@ with st.sidebar:
 
 
 def load_todos(user_id: int, category: str) -> pd.DataFrame:
-    return run_query(
+    return cached_query(
+        f"todos_{user_id}_{category}",
         "SELECT t.id, t.content, t.subject_id, s.name AS subject_name "
         "FROM todos t LEFT JOIN subjects s ON t.subject_id = s.id "
         "WHERE t.user_id = :uid AND t.category = :cat ORDER BY t.created_at;",
@@ -27,41 +29,63 @@ def load_todos(user_id: int, category: str) -> pd.DataFrame:
 
 
 def add_todo(user_id: int, category: str, subject_id, content: str):
-    run_write(
+    new_id = run_write_returning_id(
         "INSERT INTO todos (user_id, category, subject_id, content) "
-        "VALUES (:uid, :cat, :sid, :content);",
+        "VALUES (:uid, :cat, :sid, :content) RETURNING id;",
         {"uid": user_id, "cat": category, "sid": subject_id, "content": content},
+    )
+    subject_name = None
+    if subject_id:
+        subjects_df = get_subjects(user_id)
+        match = subjects_df[subjects_df["id"] == subject_id] if not subjects_df.empty else subjects_df
+        if not match.empty:
+            subject_name = match.iloc[0]["name"]
+    cache_append_row(
+        f"todos_{user_id}_{category}",
+        {"id": new_id, "content": content, "subject_id": subject_id, "subject_name": subject_name},
     )
 
 
-def delete_todo(todo_id: int):
+def delete_todo(user_id: int, category: str, todo_id: int):
     run_write("DELETE FROM todos WHERE id = :id;", {"id": todo_id})
+    cache_delete_row(f"todos_{user_id}_{category}", "id", todo_id)
+
+
+# ============================================================
+# 일정(events)은 유저 전체를 한 번만 캐싱해두고, 일/주/월 등 조회 범위는
+# 그때그때 메모리에서 필터링합니다. (날짜 범위별로 따로 캐싱하면
+# 같은 이벤트가 여러 캐시에 중복 저장되어 갱신이 꼬일 수 있어서 이렇게 통일했어요.)
+# ============================================================
+def _load_all_events(user_id: int) -> pd.DataFrame:
+    return cached_query(
+        f"all_events_{user_id}",
+        "SELECT e.id, e.category, e.title, e.event_date, e.start_time, e.end_time, e.memo, e.is_done, "
+        "s.name AS subject_name FROM events e LEFT JOIN subjects s ON e.subject_id = s.id "
+        "WHERE e.user_id = :uid ORDER BY e.event_date, e.start_time;",
+        {"uid": user_id},
+    )
 
 
 def load_events(user_id: int, category, date_from: datetime.date, date_to: datetime.date) -> pd.DataFrame:
-    if category is None:
-        return run_query(
-            "SELECT e.id, e.category, e.title, e.event_date, e.start_time, e.end_time, e.memo, e.is_done, "
-            "s.name AS subject_name FROM events e LEFT JOIN subjects s ON e.subject_id = s.id "
-            "WHERE e.user_id = :uid "
-            "AND e.event_date BETWEEN :df AND :dt ORDER BY e.event_date, e.start_time;",
-            {"uid": user_id, "df": date_from, "dt": date_to},
-        )
-    return run_query(
-        "SELECT e.id, e.category, e.title, e.event_date, e.start_time, e.end_time, e.memo, e.is_done, "
-        "s.name AS subject_name FROM events e LEFT JOIN subjects s ON e.subject_id = s.id "
-        "WHERE e.user_id = :uid AND e.category = :cat "
-        "AND e.event_date BETWEEN :df AND :dt ORDER BY e.event_date, e.start_time;",
-        {"uid": user_id, "cat": category, "df": date_from, "dt": date_to},
-    )
+    all_events = _load_all_events(user_id)
+    if all_events.empty:
+        return all_events
+    mask = (all_events["event_date"] >= date_from) & (all_events["event_date"] <= date_to)
+    if category is not None:
+        mask &= all_events["category"] == category
+    return all_events[mask]
 
 
-def toggle_event_done(event_id: int, is_done: bool):
+def toggle_event_done(user_id: int, event_id: int, is_done: bool):
     run_write("UPDATE events SET is_done = :v WHERE id = :id;", {"v": is_done, "id": event_id})
+    cache_update_row(f"all_events_{user_id}", "id", event_id, {"is_done": is_done})
 
 
-def delete_event(event_id: int):
+def delete_event(user_id: int, event_id: int):
     run_write("DELETE FROM events WHERE id = :id;", {"id": event_id})
+    cache_delete_row(f"all_events_{user_id}", "id", event_id)
+
+
 
 def _event_minutes(t: datetime.time | None):
     return t.hour * 60 + t.minute if t is not None else None
@@ -172,14 +196,13 @@ def render_day_events(user_id: int, category, d: datetime.date, key_prefix: str)
             key=f"ev_{key_prefix}_{ev['id']}",
         )
         if checked != bool(ev["is_done"]):
-            toggle_event_done(ev["id"], checked)
-            st.rerun()
+            toggle_event_done(user_id, ev["id"], checked)
         with st.expander("상세"):
             st.write(ev["memo"] or "메모 없음")
             if ev["subject_name"]:
                 st.caption(f"과목: {ev['subject_name']}")
             if st.button("이 일정 삭제", key=f"del_ev_{key_prefix}_{ev['id']}"):
-                delete_event(ev["id"])
+                delete_event(user_id, ev["id"])
                 st.rerun()
 
 
@@ -248,7 +271,6 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
             submitted = st.form_submit_button("➕ 추가")
         if submitted and content.strip():
             add_todo(user_id, category, subject_id, content.strip())
-            st.rerun()
 
     todos_df = load_todos(user_id, category)
     if todos_df.empty:
@@ -264,7 +286,7 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
                     st.session_state[f"placing_{row['id']}"] = True
             with c3:
                 if st.button("삭제", key=f"del_todo_{category}_{row['id']}"):
-                    delete_todo(row["id"])
+                    delete_todo(user_id, category, row["id"])
                     st.rerun()
 
             if st.session_state.get(f"placing_{row['id']}"):
@@ -278,7 +300,7 @@ def render_schedule_category(user_id: int, category: str, subjects_df: pd.DataFr
                         add_event(
                             user_id, category, row["subject_id"], row["content"], d, st_time, et_time, memo
                         )
-                        delete_todo(row["id"])
+                        delete_todo(user_id, category, row["id"])
                         st.session_state[f"placing_{row['id']}"] = False
                         st.rerun()
 

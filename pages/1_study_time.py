@@ -6,7 +6,10 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
-from common import require_login, sidebar_user_info, run_query, run_write, get_subjects, conn
+from common import (
+    require_login, sidebar_user_info, run_query, run_write, run_write_returning_id,
+    get_subjects, conn, cache_append_row, cache_delete_row,
+)
 
 
 user_id, name, authenticator = require_login()
@@ -16,14 +19,16 @@ with st.sidebar:
 
 
 def add_subject(user_id: int, name: str, color: str):
-    run_write(
-        "INSERT INTO subjects (user_id, name, color) VALUES (:uid, :name, :color);",
+    new_id = run_write_returning_id(
+        "INSERT INTO subjects (user_id, name, color) VALUES (:uid, :name, :color) RETURNING id;",
         {"uid": user_id, "name": name, "color": color},
     )
+    cache_append_row(f"subjects_{user_id}", {"id": new_id, "name": name, "color": color})
 
 
-def delete_subject(subject_id: int):
+def delete_subject(user_id: int, subject_id: int):
     run_write("DELETE FROM subjects WHERE id = :id;", {"id": subject_id})
+    cache_delete_row(f"subjects_{user_id}", "id", subject_id)
 
 
 def subjects_manager(user_id: int):
@@ -38,12 +43,14 @@ def subjects_manager(user_id: int):
 
         if st.button("➕ 과목 추가"):
             if new_name.strip():
-                try:
-                    add_subject(user_id, new_name.strip(), new_color)
-                    st.success(f"'{new_name}' 과목을 추가했습니다.")
-                    st.rerun()
-                except Exception:
+                if new_name.strip() in list(subjects_df["name"]):
                     st.warning("이미 존재하는 과목명입니다.")
+                else:
+                    try:
+                        add_subject(user_id, new_name.strip(), new_color)
+                        st.success(f"'{new_name}' 과목을 추가했습니다.")
+                    except Exception:
+                        st.warning("이미 존재하는 과목명입니다.")
             else:
                 st.warning("과목명을 입력해 주세요.")
 
@@ -60,7 +67,7 @@ def subjects_manager(user_id: int):
                     )
                 with c2:
                     if st.button("삭제", key=f"del_subject_{row['id']}"):
-                        delete_subject(row["id"])
+                        delete_subject(user_id, row["id"])
                         st.rerun()
 
 
@@ -79,24 +86,36 @@ def load_study_blocks(user_id: int, study_date: datetime.date) -> pd.DataFrame:
     )
 
 
+def _bulk_insert_study_blocks(session, user_id: int, study_date: datetime.date, rows: list[tuple[int, int]]):
+    """rows: (subject_id, slot_index) 튜플 목록. 한 번의 INSERT 문으로 전부 삽입."""
+    if not rows:
+        return
+    values_clause = ", ".join(f"(:uid, :d, :sid{i}, :si{i})" for i in range(len(rows)))
+    params = {"uid": user_id, "d": study_date}
+    for i, (subject_id, slot_index) in enumerate(rows):
+        params[f"sid{i}"] = subject_id
+        params[f"si{i}"] = slot_index
+    query = (
+        "INSERT INTO study_blocks (user_id, study_date, subject_id, slot_index) "
+        f"VALUES {values_clause};"
+    )
+    session.execute(text(query), params)
+
+
 def save_study_grid(user_id: int, study_date: datetime.date, grid_df: pd.DataFrame, name_to_id: dict):
+    rows = []
+    for r, hour_label in enumerate(HOUR_LABELS):
+        for c, min_label in enumerate(MIN_LABELS):
+            val = grid_df.iat[r, c]
+            if val:
+                rows.append((name_to_id[val], r * 6 + c))
+
     with conn.session as s:
         s.execute(
             text("DELETE FROM study_blocks WHERE user_id = :uid AND study_date = :d;"),
             {"uid": user_id, "d": study_date},
         )
-        for r, hour_label in enumerate(HOUR_LABELS):
-            for c, min_label in enumerate(MIN_LABELS):
-                val = grid_df.iat[r, c]
-                if val:
-                    slot_index = r * 6 + c
-                    s.execute(
-                        text(
-                            "INSERT INTO study_blocks (user_id, subject_id, study_date, slot_index) "
-                            "VALUES (:uid, :sid, :d, :si);"
-                        ),
-                        {"uid": user_id, "sid": name_to_id[val], "d": study_date, "si": slot_index},
-                    )
+        _bulk_insert_study_blocks(s, user_id, study_date, rows)
         s.commit()
 
 
@@ -126,14 +145,8 @@ def quick_fill_blocks(user_id: int, study_date: datetime.date, subject_id: int,
             ),
             {"uid": user_id, "d": study_date, "s": slot_start, "e": slot_end},
         )
-        for slot in range(slot_start, slot_end):
-            s.execute(
-                text(
-                    "INSERT INTO study_blocks (user_id, subject_id, study_date, slot_index) "
-                    "VALUES (:uid, :sid, :d, :si);"
-                ),
-                {"uid": user_id, "sid": subject_id, "d": study_date, "si": slot},
-            )
+        rows = [(subject_id, slot) for slot in range(slot_start, slot_end)]
+        _bulk_insert_study_blocks(s, user_id, study_date, rows)
         s.commit()
     return slot_end - slot_start
 
