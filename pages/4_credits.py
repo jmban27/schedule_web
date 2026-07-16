@@ -224,8 +224,16 @@ def add_timetable_course(user_id: int, name: str, format_: str, campus: str, cat
     if not match.empty:
         color = match.iloc[0]["color"]
     else:
-        distinct_count = int(existing["name"].nunique()) if not existing.empty else 0
-        color = TIMETABLE_PALETTE[distinct_count % len(TIMETABLE_PALETTE)]
+        used_colors = (
+            set(existing.drop_duplicates(subset="name")["color"]) if not existing.empty else set()
+        )
+        available = [c for c in TIMETABLE_PALETTE if c not in used_colors]
+        if available:
+            color = available[0]
+        else:
+            # 팔레트를 다 써버린 경우에만 순환 재사용
+            distinct_count = int(existing["name"].nunique()) if not existing.empty else 0
+            color = TIMETABLE_PALETTE[distinct_count % len(TIMETABLE_PALETTE)]
 
     new_id = run_write_returning_id(
         "INSERT INTO timetable_courses "
@@ -258,6 +266,38 @@ def delete_timetable_courses(user_id: int, course_ids):
             s.execute(text("DELETE FROM timetable_courses WHERE id = :id;"), {"id": int(cid)})
         s.commit()
     cache_delete_rows(f"timetable_{user_id}", "id", course_ids)
+
+
+def update_timetable_course(user_id: int, course_id: int, format_: str, campus: str, category: str,
+                             credit: float, day_of_week: str, start_hour: int, end_hour: int):
+    run_write(
+        "UPDATE timetable_courses SET format = :fmt, campus = :campus, category = :category, "
+        "credit = :credit, day_of_week = :day, start_hour = :sh, end_hour = :eh WHERE id = :id;",
+        {
+            "fmt": format_, "campus": campus, "category": category, "credit": credit,
+            "day": day_of_week, "sh": start_hour, "eh": end_hour, "id": course_id,
+        },
+    )
+    cache_update_row(
+        f"timetable_{user_id}", "id", course_id,
+        {
+            "format": format_, "campus": campus, "category": category, "credit": credit,
+            "day_of_week": day_of_week, "start_hour": start_hour, "end_hour": end_hour,
+        },
+    )
+
+
+def reassign_timetable_colors(user_id: int):
+    """과목명별로 색상이 겹치지 않도록 전부 다시 배정합니다 (과거 데이터의 색상 겹침을 정리할 때 사용)."""
+    df = get_timetable_courses(user_id)
+    if df.empty:
+        return
+    distinct_names = list(dict.fromkeys(df["name"].tolist()))  # 등장 순서 유지하며 중복 제거
+    for i, nm in enumerate(distinct_names):
+        color = TIMETABLE_PALETTE[i % len(TIMETABLE_PALETTE)]
+        for cid in df.loc[df["name"] == nm, "id"].tolist():
+            run_write("UPDATE timetable_courses SET color = :c WHERE id = :id;", {"c": color, "id": cid})
+            cache_update_row(f"timetable_{user_id}", "id", cid, {"color": color})
 
 
 def render_weekly_timetable_html(courses_df: pd.DataFrame) -> str:
@@ -515,7 +555,14 @@ def page_credits(user_id: int):
     st.markdown(render_weekly_timetable_html(timetable_df), unsafe_allow_html=True)
 
     if not timetable_df.empty:
-        st.markdown("**등록된 과목**")
+        top_col1, top_col2 = st.columns([4, 1.5])
+        with top_col1:
+            st.markdown("**등록된 과목**")
+        with top_col2:
+            if st.button("🎨 색상 겹침 정리", key="fix_tt_colors"):
+                reassign_timetable_colors(user_id)
+                st.rerun()
+
         day_order = {d: i for i, d in enumerate(TIMETABLE_DAYS)}
         for name, group in timetable_df.groupby("name", sort=False):
             first = group.iloc[0]
@@ -526,7 +573,7 @@ def page_credits(user_id: int):
             time_str = ", ".join(
                 f"{r['day_of_week']} {r['start_hour']}:00-{r['end_hour']}:00" for _, r in sorted_group.iterrows()
             )
-            c1, c2 = st.columns([5, 1])
+            c1, c2, c3 = st.columns([4, 1, 1])
             with c1:
                 st.markdown(
                     f"<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
@@ -536,9 +583,76 @@ def page_credits(user_id: int):
                     unsafe_allow_html=True,
                 )
             with c2:
+                if st.button("수정", key=f"edit_tt_{name}"):
+                    st.session_state[f"editing_tt_{name}"] = not st.session_state.get(f"editing_tt_{name}", False)
+            with c3:
                 if st.button("삭제", key=f"del_tt_{name}"):
                     delete_timetable_courses(user_id, group["id"].tolist())
                     st.rerun()
+
+            if st.session_state.get(f"editing_tt_{name}"):
+                with st.form(f"edit_tt_form_{name}"):
+                    st.caption(f"'{name}' 수정 (과목명은 변경할 수 없어요)")
+                    ec1, ec2, ec3, ec4 = st.columns(4)
+                    with ec1:
+                        edit_format = st.selectbox(
+                            "진행 방식", ["대면", "비대면", "블렌디드"],
+                            index=["대면", "비대면", "블렌디드"].index(first["format"]),
+                            key=f"edit_fmt_{name}",
+                        )
+                    with ec2:
+                        edit_campus = st.selectbox(
+                            "캠퍼스", ["신촌", "송도"], index=["신촌", "송도"].index(first["campus"]),
+                            key=f"edit_campus_{name}",
+                        )
+                    with ec3:
+                        edit_category = st.selectbox(
+                            "구분", CATEGORIES, index=CATEGORIES.index(first["category"]),
+                            key=f"edit_cat_{name}",
+                        )
+                    with ec4:
+                        edit_credit = st.selectbox(
+                            "학점", [0.5, 1, 2, 3], index=[0.5, 1, 2, 3].index(float(first["credit"])),
+                            key=f"edit_credit_{name}",
+                        )
+
+                    st.caption("시간 블록")
+                    block_inputs = []
+                    end_options = list(range(10, 21))
+                    for i, (_, blk) in enumerate(sorted_group.iterrows()):
+                        bc1, bc2, bc3 = st.columns(3)
+                        with bc1:
+                            bd = st.selectbox(
+                                f"요일 (블록 {i + 1})", TIMETABLE_DAYS,
+                                index=TIMETABLE_DAYS.index(blk["day_of_week"]),
+                                key=f"edit_day_{name}_{blk['id']}",
+                            )
+                        with bc2:
+                            bs = st.selectbox(
+                                f"시작 시간 (블록 {i + 1})", TIMETABLE_HOURS,
+                                index=TIMETABLE_HOURS.index(int(blk["start_hour"])),
+                                key=f"edit_start_{name}_{blk['id']}",
+                            )
+                        with bc3:
+                            be = st.selectbox(
+                                f"종료 시간 (블록 {i + 1})", end_options,
+                                index=end_options.index(int(blk["end_hour"])),
+                                key=f"edit_end_{name}_{blk['id']}",
+                            )
+                        block_inputs.append((int(blk["id"]), bd, bs, be))
+
+                    save_clicked = st.form_submit_button("💾 저장")
+                    if save_clicked:
+                        if any(be <= bs for (_, _, bs, be) in block_inputs):
+                            st.warning("각 블록의 종료 시간이 시작 시간보다 늦어야 합니다.")
+                        else:
+                            for cid, bd, bs, be in block_inputs:
+                                update_timetable_course(
+                                    user_id, cid, edit_format, edit_campus, edit_category,
+                                    edit_credit, bd, bs, be,
+                                )
+                            st.session_state[f"editing_tt_{name}"] = False
+                            st.rerun()
 
     st.divider()
 
