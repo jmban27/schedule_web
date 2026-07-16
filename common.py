@@ -181,13 +181,32 @@ def get_overdue_lectures(user_id: int) -> pd.DataFrame:
 
 # ============================================================
 # 공통: 캘린더 일정 추가 — 일정 관리 / 강의 수강 현황(마감일 자동 연동)에서 함께 사용
+# 이벤트는 유저별로 전체를 한 번에 캐싱해두고(날짜 필터는 각 페이지에서 메모리로 처리),
+# 새 일정이 생기면 그 캐시에도 즉시 추가합니다.
 # ============================================================
 def add_event(user_id, category, subject_id, title, event_date, start_time, end_time, memo, lecture_id=None):
-    run_write(
+    new_id = run_write_returning_id(
         "INSERT INTO events (user_id, category, subject_id, lecture_id, title, event_date, "
-        "start_time, end_time, memo) VALUES (:uid, :cat, :sid, :lid, :title, :d, :st, :et, :memo);",
+        "start_time, end_time, memo) VALUES (:uid, :cat, :sid, :lid, :title, :d, :st, :et, :memo) "
+        "RETURNING id;",
         {
             "uid": user_id, "cat": category, "sid": subject_id, "lid": lecture_id, "title": title,
             "d": event_date, "st": start_time, "et": end_time, "memo": memo,
         },
     )
+    subject_name = None
+    if subject_id:
+        subjects_df = get_subjects(user_id)
+        match = subjects_df[subjects_df["id"] == subject_id] if not subjects_df.empty else subjects_df
+        if not match.empty:
+            subject_name = match.iloc[0]["name"]
+
+    cache_append_row(
+        f"all_events_{user_id}",
+        {
+            "id": new_id, "category": category, "subject_id": subject_id, "title": title,
+            "event_date": event_date, "start_time": start_time, "end_time": end_time,
+            "memo": memo, "is_done": False, "subject_name": subject_name,
+        },
+    )
+    return new_id
