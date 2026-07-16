@@ -477,7 +477,7 @@ def page_credits(user_id: int):
                 key=lambda col: col.map(day_order) if col.name == "day_of_week" else col,
             )
             time_str = ", ".join(
-                f"{r['day_of_week']} {r['start_hour']}:00~{r['end_hour']}:00" for _, r in sorted_group.iterrows()
+                f"{r['day_of_week']} {r['start_hour']}:00-{r['end_hour']}:00" for _, r in sorted_group.iterrows()
             )
             c1, c2 = st.columns([5, 1])
             with c1:

@@ -167,7 +167,7 @@ def render_day_events(user_id: int, category, d: datetime.date, key_prefix: str)
         if category is None:
             cat_tag = " 📚" if ev["category"] == "study" else " 🏠"
         checked = st.checkbox(
-            f"{ev['title']}{cat_tag} ({ev['start_time']}~{ev['end_time']})",
+            f"{ev['title']}{cat_tag} ({ev['start_time']}-{ev['end_time']})",
             value=bool(ev["is_done"]),
             key=f"ev_{key_prefix}_{ev['id']}",
         )
